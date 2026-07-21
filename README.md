@@ -1,31 +1,19 @@
 # wire-extractor
 
-One command: freeze a Lamdera app’s `ToBackend`/`ToFrontend` wire surface as `Protocol.elm`, generate Wire3 property proofs, and run them.
+Freeze a Lamdera app’s `ToBackend` / `ToFrontend` as one `Protocol.elm`, generate Wire3 proofs, run them.
 
 ```bash
 node path/to/wire-extractor/bin/wire-extractor.js
-# or:  node .../wire-extractor.js --project /path/to/app
+# node .../wire-extractor.js --project /path/to/app
+# node .../wire-extractor.js extract-only -o Protocol.elm
 ```
 
 Needs: `elm-review`, `elm-test-rs`, `lamdera`.
 
-Writes `tests/Protocol.elm` + `tests/ProtocolWireProof.elm`, then runs:
+Writes `tests/Protocol.elm` + `tests/ProtocolWireProof.elm`, then:
 
-```text
-protocol-encode → app-decode → app-encode → protocol-decode
-```
+`protocol-encode → app-decode → app-encode → protocol-decode` (real `w3_*`, exhaustive + fuzz).
 
-(byte-identical Wire3 via real `w3_*` codecs; exhaustive ctors + fuzz where args are kernel types.)
-
-```bash
-# protocol file only, no tests
-node .../wire-extractor.js extract-only -o Protocol.elm
-```
-
-Multi-app smoke (not the main CLI):
-
-```bash
-node scripts/prove-compiling-projects.js --git-root ~/git
-```
+Multi-app smoke (optional): `node scripts/prove-compiling-projects.js --git-root ~/git`
 
 MIT · https://github.com/sjalq/wire-extractor

@@ -1,7 +1,7 @@
 {
   "name": "wire-extractor",
   "version": "1.0.0",
-  "description": "Extract ToBackend/ToFrontend wire protocol from any Lamdera app and prove Wire3 identity with property tests",
+  "description": "Extract ToBackend/ToFrontend wire protocol from any Lamdera app and prove Wire3 identity",
   "license": "MIT",
   "bin": {
     "wire-extractor": "./bin/wire-extractor.js"
@@ -10,6 +10,7 @@
     "bin/",
     "review/src/",
     "review/elm.json",
+    "scripts/prove-compiling-projects.js",
     "README.md",
     "LICENSE"
   ],
@@ -21,10 +22,7 @@
     "lamdera",
     "elm",
     "wire3",
-    "protocol",
-    "elm-review",
-    "elm-syntax",
-    "wire-extractor"
+    "protocol"
   ],
   "engines": {
     "node": ">=16"

@@ -1,9 +1,5 @@
 module ExtractWireProtocol exposing (rule)
 
-{-| elm-review data extractor: freeze ToBackend / ToFrontend and transitive types
-into a single Elm module source string.
--}
-
 import Dict exposing (Dict)
 import Elm.Docs as Docs
 import Elm.Syntax.Declaration as Declaration exposing (Declaration)

@@ -875,7 +875,7 @@ emitElm rootBe rootFe included unresolved =
             if List.isEmpty allErrors && List.isEmpty finalUnresolved then
                 -- Use full `emittable` (incl. externalized package types) so samples can
                 -- construct OAuth.* / package values; externalized controls qualifiers.
-                emitProofElm rootBe rootFe emitName emittable externalized
+                emitProofElm rootBe rootFe emittable externalized
 
             else
                 "module ProtocolWireProof exposing (suite)\n\nimport Test exposing (Test, test, describe)\nimport Expect\n\nsuite : Test\nsuite =\n    test \"extract incomplete\" <| \\_ -> Expect.fail \"Protocol extract had errors\"\n"
@@ -918,8 +918,8 @@ build a minimal Protocol value and prove:
 
 with identical Wire3 byte lists (real Lamdera w3_* codecs).
 -}
-emitProofElm : TypeKey -> TypeKey -> (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> String
-emitProofElm rootBe rootFe emitName included externalized =
+emitProofElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> String
+emitProofElm rootBe rootFe included externalized =
     let
         allRefs =
             included
@@ -974,7 +974,7 @@ emitProofElm rootBe rootFe emitName included externalized =
                     [ "import Expect exposing (Expectation)"
                     , "import Lamdera.Wire3 as Wire3"
                     , "import Protocol"
-                    , "import Fuzz exposing (Fuzzer)"
+                    , "import Fuzz"
                     , "import Test exposing (Test, describe, fuzz, test)"
                     , "import Types"
                     , if needsUrl then
@@ -1049,10 +1049,10 @@ exampleUrl =
                 ""
 
         beSamples =
-            sampleConstructors rootBe emitName included externalized "ToBackend"
+            sampleConstructors rootBe included externalized "ToBackend"
 
         feSamples =
-            sampleConstructors rootFe emitName included externalized "ToFrontend"
+            sampleConstructors rootFe included externalized "ToFrontend"
 
         beList =
             "allToBackend : List ( String, Protocol.ToBackend )\nallToBackend =\n    [ "
@@ -1199,15 +1199,15 @@ suite =
         ++ body
 
 
-sampleConstructors : TypeKey -> (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> String -> List String
-sampleConstructors rootKey emitName included externalized rootLabel =
+sampleConstructors : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> String -> List String
+sampleConstructors rootKey included externalized rootLabel =
     case Dict.get rootKey included of
         Just (Custom { constructors }) ->
             List.map
                 (\ctor ->
                     let
                         expr =
-                            minimalCtorExpr emitName included externalized rootKey ctor Dict.empty Set.empty
+                            minimalCtorExpr included externalized rootKey ctor Dict.empty Set.empty
                     in
                     "( \"" ++ ctor.name ++ "\", " ++ expr ++ " )"
                 )
@@ -1537,8 +1537,8 @@ unconstructable reason =
     "Debug.todo \"wire-extractor cannot invent sample: " ++ reason ++ "\""
 
 
-minimalCtorExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
-minimalCtorExpr emitName included externalized typeKey ctor subst visiting =
+minimalCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
+minimalCtorExpr included externalized typeKey ctor subst visiting =
     let
         head =
             ctorQualifier typeKey externalized ++ ctor.name
@@ -1555,13 +1555,13 @@ minimalCtorExpr emitName included externalized typeKey ctor subst visiting =
                 ++ " "
                 ++ String.join " "
                     (List.map
-                        (\ann -> "(" ++ minimalAnnExpr emitName included externalized ann (Set.insert typeKey visiting) ++ ")")
+                        (\ann -> "(" ++ minimalAnnExpr included externalized ann (Set.insert typeKey visiting) ++ ")")
                         args
                     )
 
 
-minimalAnnExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeAnn -> Set TypeKey -> String
-minimalAnnExpr emitName included externalized ann visiting =
+minimalAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeAnn -> Set TypeKey -> String
+minimalAnnExpr included externalized ann visiting =
     case ann of
         Generic name ->
             unconstructable ("unsubstituted type variable `" ++ name ++ "`")
@@ -1570,12 +1570,12 @@ minimalAnnExpr emitName included externalized ann visiting =
             "()"
 
         Typed key args ->
-            minimalTypedExpr emitName included externalized (normalizeKey key) args visiting
+            minimalTypedExpr included externalized (normalizeKey key) args visiting
 
         Tupled items ->
             "("
                 ++ String.join ", "
-                    (List.map (\a -> minimalAnnExpr emitName included externalized a visiting) items)
+                    (List.map (\a -> minimalAnnExpr included externalized a visiting) items)
                 ++ ")"
 
         Record fields ->
@@ -1587,21 +1587,21 @@ minimalAnnExpr emitName included externalized ann visiting =
                     ++ String.join ", "
                         (List.map
                             (\( n, t ) ->
-                                n ++ " = " ++ minimalAnnExpr emitName included externalized t visiting
+                                n ++ " = " ++ minimalAnnExpr included externalized t visiting
                             )
                             fields
                         )
                     ++ " }"
 
         ExtensibleRecord _ fields ->
-            minimalAnnExpr emitName included externalized (Record fields) visiting
+            minimalAnnExpr included externalized (Record fields) visiting
 
         Function _ _ ->
             unconstructable "function type on wire"
 
 
-minimalTypedExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> List TypeAnn -> Set TypeKey -> String
-minimalTypedExpr emitName included externalized key typeArgs visiting =
+minimalTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> List TypeAnn -> Set TypeKey -> String
+minimalTypedExpr included externalized key typeArgs visiting =
     let
         ( mod, name ) =
             parseKey key
@@ -1634,7 +1634,7 @@ minimalTypedExpr emitName included externalized key typeArgs visiting =
     else if name == "Result" || key == "Result" || modStr == "Result" then
         case typeArgs of
             [ errAnn, _ ] ->
-                "Err (" ++ minimalAnnExpr emitName included externalized errAnn visiting ++ ")"
+                "Err (" ++ minimalAnnExpr included externalized errAnn visiting ++ ")"
 
             _ ->
                 "Err \"\""
@@ -1721,7 +1721,7 @@ minimalTypedExpr emitName included externalized key typeArgs visiting =
                     subst =
                         makeSubst generics typeArgs
                 in
-                minimalAnnExpr emitName included externalized (applySubst subst body) visiting
+                minimalAnnExpr included externalized (applySubst subst body) visiting
 
             Just (Custom { constructors, generics }) ->
                 let
@@ -1745,7 +1745,7 @@ minimalTypedExpr emitName included externalized key typeArgs visiting =
                     unconstructable ("no constructors for " ++ key)
 
                 else
-                    minimalCtorExpr emitName included externalized key chosen subst visiting
+                    minimalCtorExpr included externalized key chosen subst visiting
 
             Nothing ->
                 -- Externalized / package types with known construction patterns
