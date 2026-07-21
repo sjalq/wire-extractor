@@ -5,6 +5,7 @@ module ProtocolIR exposing
     , TypeDef
     , TypeKey
     , closeFromRoots
+    , docsSampleCandidates
     , emitElm
     , findRoots
     , fromDocsAlias
@@ -1293,19 +1294,34 @@ sampleConstructors rootKey included externalized docsIndex rootLabel =
             [ "( \"MISSING\", " ++ unconstructable ("no " ++ rootLabel ++ " constructors") ++ " )" ]
 
 
-{-| Prefer nullary docs values (empty/origin/…), then unary from* with inventable args.
+{-| Matching docs value names for a type (no arg invention). Useful for debugging.
 -}
-docsSampleExpr : DocsIndex -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Set TypeKey -> Maybe String
-docsSampleExpr docsIndex included externalized typeKey visiting =
+docsSampleCandidates : DocsIndex -> TypeKey -> List String
+docsSampleCandidates docsIndex typeKey =
+    docsSampleScored docsIndex typeKey
+        |> List.map
+            (\c ->
+                c.moduleName ++ "." ++ c.value.name ++ "#arity" ++ String.fromInt (List.length c.params)
+            )
+
+
+type alias DocsCandidate =
+    { score : Int
+    , moduleName : String
+    , value : DocsValue
+    , params : List ElmType.Type
+    }
+
+
+docsSampleScored : DocsIndex -> TypeKey -> List DocsCandidate
+docsSampleScored docsIndex typeKey =
     let
-        ( mod, typeName ) =
+        ( mod, _ ) =
             parseKey typeKey
 
         modStr =
             String.join "." mod
 
-        -- Prefer the type's own module; fall back to scanning all package docs
-        -- (handles re-exports and odd module placement).
         values : List ( String, DocsValue )
         values =
             let
@@ -1327,29 +1343,31 @@ docsSampleExpr docsIndex included externalized typeKey visiting =
 
             else
                 fromHome
-
-        scored =
-            values
-                |> List.filterMap
-                    (\( moduleName, v ) ->
-                        let
-                            ( arity, params, result ) =
-                                peelFunction v.tipe
-                        in
-                        if resultMatchesType typeKey result then
-                            Just
-                                { score = sampleScore v.name arity
-                                , moduleName = moduleName
-                                , value = v
-                                , params = params
-                                }
-
-                        else
-                            Nothing
-                    )
-                |> List.sortBy .score
     in
-    scored
+    values
+        |> List.filterMap
+            (\( moduleName, v ) ->
+                let
+                    ( arity, params, result ) =
+                        peelFunction v.tipe
+                in
+                if resultMatchesType typeKey result then
+                    Just
+                        { score = sampleScore v.name arity
+                        , moduleName = moduleName
+                        , value = v
+                        , params = params
+                        }
+
+                else
+                    Nothing
+            )
+        |> List.sortBy .score
+
+
+docsSampleExpr : DocsIndex -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Set TypeKey -> Maybe String
+docsSampleExpr docsIndex included externalized typeKey visiting =
+    docsSampleScored docsIndex typeKey
         |> List.filterMap
             (\best ->
                 let
