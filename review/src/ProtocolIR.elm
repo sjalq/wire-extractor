@@ -1349,37 +1349,41 @@ docsSampleExpr docsIndex included externalized typeKey visiting =
                     )
                 |> List.sortBy .score
     in
-    case scored of
-        best :: _ ->
-            let
-                argExprs =
-                    List.map
-                        (\p ->
-                            minimalAnnExpr included externalized docsIndex (fromDocsType p) visiting
-                        )
-                        best.params
-            in
-            if List.any (String.contains "Debug.todo") argExprs then
-                Nothing
-
-            else
+    scored
+        |> List.filterMap
+            (\best ->
                 let
-                    qualified =
-                        if String.isEmpty best.moduleName then
-                            best.value.name
-
-                        else
-                            best.moduleName ++ "." ++ best.value.name
+                    argExprs =
+                        List.map
+                            (\p ->
+                                minimalAnnExpr included externalized docsIndex (fromDocsType p) visiting
+                            )
+                            best.params
                 in
-                case argExprs of
-                    [] ->
-                        Just qualified
+                if List.any (String.contains "Debug.todo") argExprs then
+                    Nothing
 
-                    args ->
-                        Just (qualified ++ " " ++ String.join " " (List.map (\a -> "(" ++ a ++ ")") args))
+                else
+                    let
+                        qualified =
+                            if String.isEmpty best.moduleName then
+                                best.value.name
 
-        [] ->
-            Nothing
+                            else
+                                best.moduleName ++ "." ++ best.value.name
+                    in
+                    case argExprs of
+                        [] ->
+                            Just qualified
+
+                        args ->
+                            Just
+                                (qualified
+                                    ++ " "
+                                    ++ String.join " " (List.map (\a -> "(" ++ a ++ ")") args)
+                                )
+            )
+        |> List.head
 
 
 peelFunction : ElmType.Type -> ( Int, List ElmType.Type, ElmType.Type )
