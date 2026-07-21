@@ -22,4 +22,10 @@ protocol-encode → app-decode → app-encode → protocol-decode
 node .../wire-extractor.js extract-only -o Protocol.elm
 ```
 
+Multi-app smoke (not the main CLI):
+
+```bash
+node scripts/prove-compiling-projects.js --git-root ~/git
+```
+
 MIT · https://github.com/sjalq/wire-extractor

@@ -8,3 +8,5 @@ review/elm-stuff/
 *.bak
 .env
 .env.*
+scripts/.runs/
+scripts/.inventory.log
