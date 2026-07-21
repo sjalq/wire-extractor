@@ -1,11 +1,7 @@
 #!/usr/bin/env node
 /**
- * wire-extractor — freeze ToBackend/ToFrontend as one Protocol.elm module
- * and prove Wire3 identity with property-based tests.
- *
- * Commands:
- *   extract   Write Protocol.elm (+ optional proof module)
- *   prove     Extract, write Protocol + ProtocolWireProof, run elm-test-rs
+ * wire-extractor — extract Protocol.elm, generate Wire3 proofs, run them.
+ * Default: full pipeline (extract + write + prove).
  */
 
 const { spawnSync } = require("child_process");
@@ -16,63 +12,49 @@ const TOOL_ROOT = path.resolve(__dirname, "..");
 const REVIEW_CONFIG = path.join(TOOL_ROOT, "review");
 
 function usage() {
-  console.log(`wire-extractor — Wire3 protocol extract + proof for Lamdera apps
+  console.log(`wire-extractor — Lamdera ToBackend/ToFrontend wire freeze + Wire3 proof
 
-Usage:
-  wire-extractor extract [--project DIR] [-o Protocol.elm] [--proof FILE] [--json]
-  wire-extractor prove   [--project DIR] [--tests-dir tests]
+  wire-extractor [--project DIR] [--tests-dir tests]
+      Extract Protocol.elm + ProtocolWireProof.elm and run property/exhaustive
+      Wire3 identity tests (exit non-zero if any fail).
 
-extract
-  Runs pure Elm (elm-review + elm-syntax) over the target app and writes
-  Protocol.elm: ToBackend, ToFrontend, and transitive wire payload types only.
+  wire-extractor extract-only [--project DIR] [-o Protocol.elm] [--json]
+      Write Protocol.elm only (no tests).
 
-prove
-  Writes Protocol.elm and ProtocolWireProof.elm into --tests-dir, ensures
-  elm-explorations/test is available, then runs:
-    elm-test-rs --compiler lamdera <tests-dir>/ProtocolWireProof.elm
-
-  Proofs (generated in Elm):
-    • exhaustive minimal sample per root constructor
-    • property-based fuzz for constructors with fuzzable kernel args
-    • path: protocol-encode → app-decode → app-encode → protocol-decode
-    • Wire3 byte lists must match; codecs are real Lamdera w3_* functions
-
-Options:
-  --project DIR     Lamdera app root (default: cwd)
-  -o, --output FILE Protocol.elm path (extract; default: Protocol.elm)
-  --proof FILE      Also write ProtocolWireProof.elm (extract)
-  --tests-dir DIR   Where prove writes modules (default: tests)
-  --json            Print extract JSON to stdout (extract)
-  --allow-unresolved  extract: exit 0 even if some types unresolved
-  -h, --help
+Needs: elm-review, elm-test-rs, lamdera
 `);
 }
 
 function parseArgs(argv) {
   const args = {
-    command: null,
+    mode: "run", // run | extract-only | help
     project: process.cwd(),
     output: "Protocol.elm",
-    proof: null,
     testsDir: "tests",
     json: false,
     allowUnresolved: false,
   };
   const rest = [...argv];
-  if (!rest.length || rest[0] === "-h" || rest[0] === "--help") {
-    args.command = "help";
+  if (rest[0] === "-h" || rest[0] === "--help") {
+    args.mode = "help";
     return args;
   }
-  args.command = rest.shift();
+  if (rest[0] === "extract-only" || rest[0] === "extract") {
+    args.mode = "extract-only";
+    rest.shift();
+  } else if (rest[0] === "prove" || rest[0] === "run") {
+    // aliases for default full pipeline
+    args.mode = "run";
+    rest.shift();
+  }
   while (rest.length) {
     const a = rest.shift();
     if (a === "--project") args.project = path.resolve(rest.shift());
     else if (a === "-o" || a === "--output") args.output = rest.shift();
-    else if (a === "--proof") args.proof = rest.shift();
     else if (a === "--tests-dir") args.testsDir = rest.shift();
     else if (a === "--json") args.json = true;
     else if (a === "--allow-unresolved") args.allowUnresolved = true;
-    else if (a === "-h" || a === "--help") args.command = "help";
+    else if (a === "-h" || a === "--help") args.mode = "help";
     else {
       console.error("Unknown argument:", a);
       process.exit(2);
@@ -91,6 +73,10 @@ function findBin(name) {
     if (c === name || fs.existsSync(c)) return c;
   }
   return name;
+}
+
+function resolveOut(projectDir, filePath) {
+  return path.isAbsolute(filePath) ? filePath : path.join(projectDir, filePath);
 }
 
 function runExtract(projectDir) {
@@ -146,10 +132,6 @@ function runExtract(projectDir) {
   return data;
 }
 
-function resolveOut(projectDir, filePath) {
-  return path.isAbsolute(filePath) ? filePath : path.join(projectDir, filePath);
-}
-
 function ensureTestDeps(projectDir) {
   const elmJsonPath = path.join(projectDir, "elm.json");
   const elmJson = JSON.parse(fs.readFileSync(elmJsonPath, "utf8"));
@@ -176,7 +158,7 @@ function ensureTestDeps(projectDir) {
   }
 }
 
-function cmdExtract(args) {
+function cmdExtractOnly(args) {
   const data = runExtract(args.project);
   if (args.json) {
     process.stdout.write(JSON.stringify(data, null, 2) + "\n");
@@ -191,18 +173,6 @@ function cmdExtract(args) {
     console.log("Wrote", out);
     console.log("  roots:", data.rootToBackend, "/", data.rootToFrontend);
     console.log("  included:", data.includedCount, "types");
-    if (data.unresolved && data.unresolved.length) {
-      console.log("  unresolved:", data.unresolved.join(", "));
-    }
-  }
-  if (args.proof) {
-    if (!data.proofElmSource) {
-      console.error("No proofElmSource in extract");
-      process.exit(1);
-    }
-    const proofOut = resolveOut(args.project, args.proof);
-    fs.writeFileSync(proofOut, data.proofElmSource);
-    console.log("Wrote", proofOut);
   }
   if (!data.ok && !args.allowUnresolved) {
     console.error("ERROR:", data.error || "extract ok=false");
@@ -210,22 +180,35 @@ function cmdExtract(args) {
   }
 }
 
-function cmdProve(args) {
+/** Full pipeline: extract → write Protocol + proof → elm-test-rs */
+function cmdRun(args) {
+  console.log("1/3 extract");
   const data = runExtract(args.project);
   if (!data.ok || !data.elmSource || !data.proofElmSource) {
     console.error("Extract failed:", data.error || "incomplete extract");
     process.exit(1);
   }
+
+  console.log("2/3 write Protocol.elm + ProtocolWireProof.elm");
   const testsDir = resolveOut(args.project, args.testsDir);
   fs.mkdirSync(testsDir, { recursive: true });
   const protocolPath = path.join(testsDir, "Protocol.elm");
   const proofPath = path.join(testsDir, "ProtocolWireProof.elm");
   fs.writeFileSync(protocolPath, data.elmSource);
   fs.writeFileSync(proofPath, data.proofElmSource);
-  console.log("Wrote", protocolPath);
-  console.log("Wrote", proofPath);
+  console.log("  ", protocolPath);
+  console.log("  ", proofPath);
+  console.log(
+    "  roots:",
+    data.rootToBackend,
+    "/",
+    data.rootToFrontend,
+    " types:",
+    data.includedCount
+  );
   ensureTestDeps(args.project);
 
+  console.log("3/3 prove (elm-test-rs --compiler lamdera)");
   const relProof = path.relative(args.project, proofPath) || proofPath;
   const result = spawnSync(
     findBin("elm-test-rs"),
@@ -246,22 +229,21 @@ function cmdProve(args) {
     );
     process.exit(1);
   }
-  process.exit(result.status === 0 ? 0 : result.status || 1);
+  if (result.status !== 0) {
+    console.error("Wire proof FAILED");
+    process.exit(result.status || 1);
+  }
+  console.log("Wire proof PASSED");
 }
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.command === "help" || !args.command) {
+  if (args.mode === "help") {
     usage();
-    process.exit(args.command === "help" ? 0 : 2);
+    process.exit(0);
   }
-  if (args.command === "extract") cmdExtract(args);
-  else if (args.command === "prove") cmdProve(args);
-  else {
-    console.error("Unknown command:", args.command);
-    usage();
-    process.exit(2);
-  }
+  if (args.mode === "extract-only") cmdExtractOnly(args);
+  else cmdRun(args);
 }
 
 main();
