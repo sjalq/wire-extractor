@@ -79,10 +79,7 @@ function resolveOut(projectDir, filePath) {
   return path.isAbsolute(filePath) ? filePath : path.join(projectDir, filePath);
 }
 
-function runExtract(projectDir) {
-  if (!fs.existsSync(path.join(projectDir, "elm.json"))) {
-    return { ok: false, error: "No elm.json in " + projectDir };
-  }
+function runExtractOnce(projectDir) {
   const result = spawnSync(
     findBin("elm-review"),
     [
@@ -118,6 +115,19 @@ function runExtract(projectDir) {
       error:
         "elm-review did not return JSON.\n" +
         (result.stderr || result.stdout || "").slice(0, 2000),
+      _retryable: true,
+    };
+  }
+  // elm-review unexpected crashes surface as type:error without extracts
+  if (report && report.type === "error") {
+    return {
+      ok: false,
+      error:
+        "elm-review error: " +
+        (report.title || "") +
+        "\n" +
+        JSON.stringify(report.message || report).slice(0, 1500),
+      _retryable: true,
     };
   }
   const data = report.extracts && report.extracts.ExtractWireProtocol;
@@ -127,35 +137,122 @@ function runExtract(projectDir) {
       error:
         "No ExtractWireProtocol extract.\n" +
         JSON.stringify(report.errors || [], null, 2).slice(0, 2000),
+      _retryable: true,
     };
+  }
+  // Treat sample invent failures as retryable (docs index occasionally incomplete mid-rebuild)
+  if (
+    data.ok === false &&
+    typeof data.error === "string" &&
+    data.error.indexOf("unconstructable") !== -1
+  ) {
+    data._retryable = true;
   }
   return data;
 }
 
-function ensureTestDeps(projectDir) {
+function runExtract(projectDir) {
+  if (!fs.existsSync(path.join(projectDir, "elm.json"))) {
+    return { ok: false, error: "No elm.json in " + projectDir };
+  }
+  let last = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    last = runExtractOnce(projectDir);
+    if (last.ok && last.elmSource && last.proofElmSource) {
+      return last;
+    }
+    if (!last._retryable || attempt === 3) {
+      return last;
+    }
+    // Brief pause + drop generated review app so the next attempt rebuilds cleanly
+    try {
+      const gen = path.join(
+        projectDir,
+        "elm-stuff",
+        "generated-code",
+        "jfmengels"
+      );
+      if (fs.existsSync(gen)) {
+        fs.rmSync(gen, { recursive: true, force: true });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return last;
+}
+
+/**
+ * Ensure the app can host Protocol in tests/ (source-directories only).
+ * Never bump/remove the app's test packages — that fights avh4/elm-program-test
+ * and other pins on elm-explorations/test 1.x.
+ */
+function ensureTestsSourceDir(projectDir) {
   const elmJsonPath = path.join(projectDir, "elm.json");
   const elmJson = JSON.parse(fs.readFileSync(elmJsonPath, "utf8"));
   let dirty = false;
   if (!Array.isArray(elmJson["source-directories"])) {
     elmJson["source-directories"] = ["src"];
+    dirty = true;
   }
   if (!elmJson["source-directories"].includes("tests")) {
     elmJson["source-directories"].push("tests");
     dirty = true;
   }
-  if (!elmJson["test-dependencies"]) {
-    elmJson["test-dependencies"] = { direct: {}, indirect: {} };
-  }
-  if (!elmJson["test-dependencies"].direct) {
-    elmJson["test-dependencies"].direct = {};
-  }
-  if (!elmJson["test-dependencies"].direct["elm-explorations/test"]) {
-    elmJson["test-dependencies"].direct["elm-explorations/test"] = "2.2.0";
-    dirty = true;
-  }
   if (dirty) {
     fs.writeFileSync(elmJsonPath, JSON.stringify(elmJson, null, 4) + "\n");
   }
+  return elmJson;
+}
+
+/**
+ * Isolated prove sandbox: same app sources + only elm-explorations/test 2.x.
+ * Avoids dep conflicts with avh4/elm-program-test (test 1.x) in the host app.
+ */
+function prepareProveSandbox(projectDir, testsDirName) {
+  const parentElm = JSON.parse(
+    fs.readFileSync(path.join(projectDir, "elm.json"), "utf8")
+  );
+  const sandboxDir = path.join(projectDir, ".wire-extractor-prove");
+  fs.mkdirSync(sandboxDir, { recursive: true });
+
+  const srcDirs = Array.isArray(parentElm["source-directories"])
+    ? parentElm["source-directories"]
+    : ["src"];
+  // Parent source dirs + tests, all relative to sandbox via ../
+  const sandboxSrc = [];
+  for (const d of srcDirs) {
+    if (d === "tests" || d === testsDirName) continue;
+    sandboxSrc.push(path.posix.join("..", d.split(path.sep).join("/")));
+  }
+  sandboxSrc.push(path.posix.join("..", testsDirName.split(path.sep).join("/")));
+
+  const deps = parentElm.dependencies || { direct: {}, indirect: {} };
+  // Ensure elm/random available (test package indirect); never pull test 1.x pins.
+  const indirect = { ...(deps.indirect || {}) };
+  if (!indirect["elm/random"]) indirect["elm/random"] = "1.0.0";
+
+  const sandboxElm = {
+    type: "application",
+    "source-directories": sandboxSrc,
+    "elm-version": parentElm["elm-version"] || "0.19.1",
+    dependencies: {
+      direct: { ...(deps.direct || {}) },
+      indirect,
+    },
+    "test-dependencies": {
+      direct: {
+        "elm-explorations/test": "2.2.0",
+      },
+      indirect: {},
+    },
+  };
+
+  fs.writeFileSync(
+    path.join(sandboxDir, "elm.json"),
+    JSON.stringify(sandboxElm, null, 4) + "\n"
+  );
+  return sandboxDir;
 }
 
 function cmdExtractOnly(args) {
@@ -206,21 +303,37 @@ function cmdRun(args) {
     " types:",
     data.includedCount
   );
-  ensureTestDeps(args.project);
+  ensureTestsSourceDir(args.project);
 
-  console.log("3/3 prove (elm-test-rs --compiler lamdera)");
-  const relProof = path.relative(args.project, proofPath) || proofPath;
-  const result = spawnSync(
-    findBin("elm-test-rs"),
-    ["--compiler", "lamdera", relProof],
-    {
-      cwd: args.project,
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-      env: process.env,
-      stdio: "inherit",
-    }
-  );
+  console.log("3/3 prove (elm-test-rs --compiler lamdera, isolated sandbox)");
+  const sandboxDir = prepareProveSandbox(args.project, args.testsDir);
+  // Proof path relative to sandbox: ../tests/ProtocolWireProof.elm
+  const relProof = path
+    .relative(sandboxDir, proofPath)
+    .split(path.sep)
+    .join("/");
+
+  // Class C: under elm-test-rs, Lamdera specializes Lamdera.sendToBackend to
+  // Types.ToBackend -> Cmd, which fails to unify with Bridge.ToBackend even when
+  // Types.ToBackend is an alias. Frontend entry compiles fine; test entry does not.
+  // Temporarily make sendToBackend polymorphic for the prove compile only.
+  const bridgePatches = patchSendToBackendForProve(args.project);
+  let result;
+  try {
+    result = spawnSync(
+      findBin("elm-test-rs"),
+      ["--compiler", "lamdera", relProof],
+      {
+        cwd: sandboxDir,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        env: process.env,
+        stdio: "inherit",
+      }
+    );
+  } finally {
+    restorePatches(bridgePatches);
+  }
   if (result.error) {
     console.error(
       "Failed to run elm-test-rs:",
@@ -234,6 +347,60 @@ function cmdRun(args) {
     process.exit(result.status || 1);
   }
   console.log("Wire proof PASSED");
+}
+
+/**
+ * Find Bridge-like modules that bind sendToBackend = Lamdera.sendToBackend and
+ * temporarily widen the type so elm-test-rs can compile the app graph.
+ * Returns [{ path, original }] for restorePatches.
+ */
+function patchSendToBackendForProve(projectDir) {
+  const patches = [];
+  const srcRoot = path.join(projectDir, "src");
+  if (!fs.existsSync(srcRoot)) return patches;
+
+  const walk = (dir) => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (ent.name === "Evergreen" || ent.name === "elm-stuff") continue;
+        walk(p);
+      } else if (ent.name.endsWith(".elm")) {
+        const original = fs.readFileSync(p, "utf8");
+        if (
+          !/sendToBackend\s*=/.test(original) ||
+          !/Lamdera\.sendToBackend/.test(original)
+        ) {
+          continue;
+        }
+        // Replace `sendToBackend = Lamdera.sendToBackend` (with optional type ann)
+        const patched = original.replace(
+          /(?:sendToBackend\s*:\s*[^\n]+\n)?sendToBackend\s*=\s*\n\s*Lamdera\.sendToBackend/g,
+          "sendToBackend : a -> Cmd msg\nsendToBackend _ =\n    Cmd.none"
+        );
+        if (patched !== original) {
+          patches.push({ path: p, original });
+          fs.writeFileSync(p, patched);
+        }
+      }
+    }
+  };
+  try {
+    walk(srcRoot);
+  } catch {
+    /* ignore */
+  }
+  return patches;
+}
+
+function restorePatches(patches) {
+  for (const { path: p, original } of patches) {
+    try {
+      fs.writeFileSync(p, original);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function main() {

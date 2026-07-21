@@ -81,13 +81,17 @@ function hasToBackend(projectDir) {
 
 function looksLikeLamdera(projectDir) {
   const ej = path.join(projectDir, "elm.json");
-  if (!fs.existsSync(ej)) return false;
-  const raw = fs.readFileSync(ej, "utf8");
-  // Real Lamdera apps ship lamdera/core and/or codecs (needed for Wire3 proofs).
-  return (
-    (raw.includes("lamdera/core") || raw.includes("lamdera/codecs")) &&
-    hasToBackend(projectDir)
-  );
+  try {
+    if (!fs.existsSync(ej) || !fs.statSync(ej).isFile()) return false;
+    const raw = fs.readFileSync(ej, "utf8");
+    // Real Lamdera apps ship lamdera/core and/or codecs (needed for Wire3 proofs).
+    return (
+      (raw.includes("lamdera/core") || raw.includes("lamdera/codecs")) &&
+      hasToBackend(projectDir)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function compileOk(projectDir) {
@@ -114,22 +118,10 @@ function compileOk(projectDir) {
   };
 }
 
-function listCandidates(gitRoot) {
+function listCandidates(gitRoot, maxDepth = 5) {
   if (!fs.existsSync(gitRoot)) return [];
   const out = [];
   const seen = new Set();
-  const consider = (name, dir) => {
-    if (seen.has(dir)) return;
-    if (
-      fs.existsSync(dir) &&
-      fs.statSync(dir).isDirectory() &&
-      looksLikeLamdera(dir) &&
-      hasToBackend(dir)
-    ) {
-      seen.add(dir);
-      out.push({ name, dir });
-    }
-  };
   const skipDirNames = new Set([
     "auth",
     "node_modules",
@@ -138,25 +130,50 @@ function listCandidates(gitRoot) {
     "vendor",
     "review",
     "tests",
+    "dist",
+    "build",
+    "target",
+    ".stack-work",
+    "coverage",
+    "__pycache__",
+    ".runs",
   ]);
-  for (const n of fs.readdirSync(gitRoot)) {
-    if (skipDirNames.has(n) || n.startsWith(".")) continue;
-    const top = path.join(gitRoot, n);
-    if (!fs.existsSync(top) || !fs.statSync(top).isDirectory()) continue;
-    consider(n, top);
-    // one level deeper (e.g. lamdera-infra/dashboard-sanitised)
+
+  const walk = (dir, rel, depth) => {
+    if (depth > maxDepth) return;
+    let ents;
     try {
-      for (const sub of fs.readdirSync(top)) {
-        if (skipDirNames.has(sub) || sub.startsWith(".")) continue;
-        const subDir = path.join(top, sub);
-        if (fs.existsSync(subDir) && fs.statSync(subDir).isDirectory()) {
-          consider(`${n}/${sub}`, subDir);
-        }
-      }
+      ents = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
-      /* ignore */
+      return;
     }
-  }
+
+    // Prefer the current dir as a Lamdera app when it has elm.json;
+    // still walk children for nested apps (e.g. monorepos).
+    if (fs.existsSync(path.join(dir, "elm.json"))) {
+      if (
+        !seen.has(dir) &&
+        looksLikeLamdera(dir) &&
+        hasToBackend(dir)
+      ) {
+        seen.add(dir);
+        out.push({ name: rel || path.basename(dir), dir });
+      }
+    }
+
+    for (const ent of ents) {
+      if (!ent.isDirectory()) continue;
+      if (skipDirNames.has(ent.name) || ent.name.startsWith(".")) continue;
+      walk(
+        path.join(dir, ent.name),
+        rel ? `${rel}/${ent.name}` : ent.name,
+        depth + 1
+      );
+    }
+  };
+
+  walk(gitRoot, "", 0);
+  out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
 }
 

@@ -661,13 +661,28 @@ isOpaqueCustom def =
             False
 
 
+{-| Emitted names for wire roots. Use WireToBackend / WireToFrontend rather than
+ToBackend / ToFrontend so Protocol does not introduce a second type named
+ToBackend into the app compilation unit (Lamdera treats that name specially and
+apps that re-export Bridge.ToBackend via Types aliases then fail typecheck).
+-}
+rootEmitNameBe : String
+rootEmitNameBe =
+    "WireToBackend"
+
+
+rootEmitNameFe : String
+rootEmitNameFe =
+    "WireToFrontend"
+
+
 emitNameFor : TypeKey -> TypeKey -> List String -> TypeKey -> String
 emitNameFor rootBe rootFe rootModule key =
     if key == rootBe then
-        "ToBackend"
+        rootEmitNameBe
 
     else if key == rootFe then
-        "ToFrontend"
+        rootEmitNameFe
 
     else
         let
@@ -682,65 +697,6 @@ emitNameFor rootBe rootFe rootModule key =
 
         else
             String.join "_" mod ++ "_" ++ name
-
-
-{-| Project modules keep inlined ctors. Package modules (OAuth, Http, …) are
-externalized when constructor names would collide in a single Elm module.
-Wire3 tags depend on constructor names, so we never rename them.
--}
-isLikelyPackageKey : List String -> TypeKey -> Bool
-isLikelyPackageKey rootModule key =
-    let
-        ( mod, _ ) =
-            parseKey key
-
-        modStr =
-            String.join "." mod
-
-        packageRoots =
-            Set.fromList
-                [ "OAuth"
-                , "Http"
-                , "Json"
-                , "Time"
-                , "Url"
-                , "Bytes"
-                , "Parser"
-                , "Regex"
-                , "File"
-                , "Browser"
-                , "Html"
-                , "Svg"
-                , "VirtualDom"
-                , "Process"
-                , "Task"
-                , "Platform"
-                , "Array"
-                , "Dict"
-                , "Set"
-                , "SeqDict"
-                , "List"
-                , "Maybe"
-                , "Result"
-                , "String"
-                , "Char"
-                , "Basics"
-                , "Lamdera"
-                ]
-    in
-    if List.isEmpty mod then
-        False
-
-    else if mod == rootModule then
-        False
-
-    else
-        case List.head mod of
-            Just head ->
-                Set.member head packageRoots
-
-            Nothing ->
-                False
 
 
 ctorOwners : Dict TypeKey TypeDef -> Dict String (List TypeKey)
@@ -767,11 +723,32 @@ ctorOwners included =
             Dict.empty
 
 
+type alias CollisionResolution =
+    { emittable : Dict TypeKey TypeDef
+    , packageExternalized : Set TypeKey
+    , ctorRenames : Dict String String
+    , errors : List String
+    }
+
+
+{-| Class A:
+
+Wire3 tags custom types by *sorted constructor name* (not declaration order), so
+we never rename constructors.
+
+When constructor names collide across types that would be emitted into one
+Protocol module, externalize every non-root collider (project *or* package).
+Protocol imports the original modules and references types with fully-qualified
+names. Nested wire tags stay those of the original definitions.
+
+Roots (WireToBackend / WireToFrontend) are never externalized.
+-}
 resolveConstructorCollisions :
-    List String
+    TypeKey
+    -> TypeKey
     -> Dict TypeKey TypeDef
-    -> ( Dict TypeKey TypeDef, Set TypeKey, List String )
-resolveConstructorCollisions rootModule included =
+    -> CollisionResolution
+resolveConstructorCollisions rootBe rootFe included =
     let
         owners =
             ctorOwners included
@@ -784,12 +761,13 @@ resolveConstructorCollisions rootModule included =
                 |> List.concat
                 |> Set.fromList
 
-        packageColliders =
+        -- Externalize all colliders except wire roots.
+        toExternalize =
             collidingKeys
-                |> Set.filter (isLikelyPackageKey rootModule)
+                |> Set.filter (\k -> k /= rootBe && k /= rootFe)
 
         emittable2 =
-            Set.foldl Dict.remove included packageColliders
+            Set.foldl Dict.remove included toExternalize
 
         owners2 =
             ctorOwners emittable2
@@ -800,14 +778,42 @@ resolveConstructorCollisions rootModule included =
                 |> List.filter (\( _, ks ) -> List.length (unique ks) > 1)
                 |> List.map
                     (\( ctorName, ks ) ->
-                        "Constructor name collision in single module: "
+                        "Constructor name collision involving wire root: "
                             ++ ctorName
                             ++ " used by "
                             ++ String.join ", " (unique ks)
-                            ++ ". Cannot flatten without breaking Wire3 tags (all owners are project types)."
+                            ++ ". Cannot externalize WireToBackend/WireToFrontend."
                     )
     in
-    ( emittable2, packageColliders, remainingErrors )
+    { emittable = emittable2
+    , packageExternalized = toExternalize
+    , ctorRenames = Dict.empty
+    , errors = remainingErrors
+    }
+
+
+{-| Lookup renamed constructor for an inlined type. Falls back to original name.
+-}
+emitCtorName : Dict String String -> TypeKey -> String -> String
+emitCtorName renames typeKey ctorName =
+    Dict.get (typeKey ++ "#" ++ ctorName) renames
+        |> Maybe.withDefault ctorName
+
+
+{-| Fully-qualified type name for an externalized key: \"Shared.Msg\".
+-}
+externalTypeName : TypeKey -> String
+externalTypeName key =
+    let
+        ( mod, name ) =
+            parseKey key
+    in
+    case mod of
+        [] ->
+            name
+
+        _ ->
+            String.join "." mod ++ "." ++ name
 
 
 externalImportLines : List TypeKey -> List String
@@ -817,7 +823,7 @@ externalImportLines keys =
         |> List.filterMap
             (\key ->
                 let
-                    ( mod, name ) =
+                    ( mod, _ ) =
                         parseKey key
 
                     modStr =
@@ -827,10 +833,136 @@ externalImportLines keys =
                     Nothing
 
                 else
-                    -- Never force (..): many package types are opaque. Expose the type
-                    -- name only; samples use public constructors/helpers when known.
-                    Just ("import " ++ modStr ++ " exposing (" ++ name ++ ")")
+                    -- Import module only; reference types as Module.Type so
+                    -- colliding short names (Msg, Error, …) stay unambiguous.
+                    Just ("import " ++ modStr)
             )
+        |> unique
+
+
+{-| When a wire root is `type alias ToBackend = Bridge.ToBackend`, fold the
+concrete custom type onto the root key and rewrite refs. Protocol then emits a
+single `type ToBackend = …` (same as Types for non-alias apps). Avoids a second
+ToBackend-shaped type (Bridge_ToBackend) that confuses Lamdera wire typing.
+-}
+collapseRootAliases : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Dict TypeKey TypeDef
+collapseRootAliases rootBe rootFe included =
+    included
+        |> collapseOneRootAlias rootBe
+        |> collapseOneRootAlias rootFe
+
+
+collapseOneRootAlias : TypeKey -> Dict TypeKey TypeDef -> Dict TypeKey TypeDef
+collapseOneRootAlias root included =
+    case Dict.get root included of
+        Just (Alias { body, generics }) ->
+            case ( generics, body ) of
+                ( [], Typed targetKey _ ) ->
+                    let
+                        target =
+                            normalizeKey targetKey
+                    in
+                    if target == root then
+                        included
+
+                    else
+                        case Dict.get target included of
+                            Just (Custom custom) ->
+                                included
+                                    |> Dict.insert root (Custom custom)
+                                    |> Dict.remove target
+                                    |> rewriteTypeKeyRefs target root
+
+                            Just (Alias _) ->
+                                -- Follow one more hop via resolve, then collapse.
+                                case resolveToCustom target included of
+                                    Just ( customKey, constructors ) ->
+                                        if customKey == root then
+                                            included
+
+                                        else
+                                            included
+                                                |> Dict.insert root (Custom { constructors = constructors, generics = [] })
+                                                |> Dict.remove customKey
+                                                |> Dict.remove target
+                                                |> rewriteTypeKeyRefs customKey root
+                                                |> rewriteTypeKeyRefs target root
+
+                                    Nothing ->
+                                        included
+
+                            Nothing ->
+                                included
+
+                _ ->
+                    included
+
+        _ ->
+            included
+
+
+rewriteTypeKeyRefs : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Dict TypeKey TypeDef
+rewriteTypeKeyRefs fromKey toKey dict =
+    dict
+        |> Dict.toList
+        |> List.map
+            (\( k, def ) ->
+                ( k, rewriteTypeDefKeys fromKey toKey def )
+            )
+        |> Dict.fromList
+
+
+rewriteTypeDefKeys : TypeKey -> TypeKey -> TypeDef -> TypeDef
+rewriteTypeDefKeys fromKey toKey def =
+    case def of
+        Custom { constructors, generics } ->
+            Custom
+                { generics = generics
+                , constructors =
+                    List.map
+                        (\c ->
+                            { c
+                                | args = List.map (rewriteTypeAnnKeys fromKey toKey) c.args
+                            }
+                        )
+                        constructors
+                }
+
+        Alias { body, generics } ->
+            Alias
+                { generics = generics
+                , body = rewriteTypeAnnKeys fromKey toKey body
+                }
+
+
+rewriteTypeAnnKeys : TypeKey -> TypeKey -> TypeAnn -> TypeAnn
+rewriteTypeAnnKeys fromKey toKey ann =
+    case ann of
+        Typed key args ->
+            let
+                key2 =
+                    if normalizeKey key == fromKey then
+                        toKey
+
+                    else
+                        key
+            in
+            Typed key2 (List.map (rewriteTypeAnnKeys fromKey toKey) args)
+
+        Tupled items ->
+            Tupled (List.map (rewriteTypeAnnKeys fromKey toKey) items)
+
+        Record fields ->
+            Record (List.map (\( n, t ) -> ( n, rewriteTypeAnnKeys fromKey toKey t )) fields)
+
+        ExtensibleRecord ext fields ->
+            ExtensibleRecord ext (List.map (\( n, t ) -> ( n, rewriteTypeAnnKeys fromKey toKey t )) fields)
+
+        Function a b ->
+            Function (rewriteTypeAnnKeys fromKey toKey a) (rewriteTypeAnnKeys fromKey toKey b)
+
+        other ->
+            other
 
 
 emitElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> List TypeKey -> Set TypeKey -> DocsIndex -> Emitted
@@ -839,10 +971,14 @@ emitElm rootBe rootFe included unresolved forceExternal docsIndex =
         rootModule =
             Tuple.first (parseKey rootBe)
 
+        -- Fold alias roots onto concrete custom types before emit/sample.
+        includedCollapsed =
+            collapseRootAliases rootBe rootFe included
+
         -- Opaque package types (empty docs constructors): import, do not redefine.
         opaqueKeys : Set TypeKey
         opaqueKeys =
-            included
+            includedCollapsed
                 |> Dict.toList
                 |> List.filter (\( _, def ) -> isOpaqueCustom def)
                 |> List.map Tuple.first
@@ -852,40 +988,46 @@ emitElm rootBe rootFe included unresolved forceExternal docsIndex =
         -- Drop opaques / unexpandable package aliases; import instead.
         emittable : Dict TypeKey TypeDef
         emittable =
-            Set.foldl Dict.remove included opaqueKeys
+            Set.foldl Dict.remove includedCollapsed opaqueKeys
 
-        -- If constructor names collide, externalize package-origin types so project
-        -- types keep wire-correct constructor names in this module.
-        ( emittable2, packageExternalized, remainingCollisionErrors ) =
-            resolveConstructorCollisions rootModule emittable
+        -- Class A: externalize package colliders; rename project colliders (Wire3 is index-based).
+        collision =
+            resolveConstructorCollisions rootBe rootFe emittable
+
+        emittable2 =
+            collision.emittable
 
         externalized : Set TypeKey
         externalized =
-            Set.union opaqueKeys packageExternalized
+            Set.union opaqueKeys collision.packageExternalized
+
+        ctorRenames =
+            collision.ctorRenames
 
         emitName : TypeKey -> String
         emitName key =
             if Set.member key externalized then
-                Tuple.second (parseKey key)
+                externalTypeName key
 
             else
                 emitNameFor rootBe rootFe rootModule key
 
         allErrors =
-            remainingCollisionErrors
+            collision.errors
 
         finalUnresolved =
             unresolved
 
+        -- Only true kernel keys go through kernelImportLines. Externalized
+        -- project/package modules use externalImportLines (qualified names).
         kernelRefs : Set TypeKey
         kernelRefs =
             emittable2
                 |> Dict.values
                 |> List.concatMap typeDefRefs
                 |> List.map normalizeKey
-                |> List.filter (\k -> isKernelKey k || Set.member k externalized)
+                |> List.filter isKernelKey
                 |> Set.fromList
-                |> (\s -> List.foldl Set.insert s (Set.toList externalized))
 
         imports =
             kernelImportLines (Set.toList kernelRefs)
@@ -898,7 +1040,7 @@ emitElm rootBe rootFe included unresolved forceExternal docsIndex =
             List.filterMap
                 (\key ->
                     Dict.get key emittable2
-                        |> Maybe.map (\def -> emitTypeDef emitName key def)
+                        |> Maybe.map (\def -> emitTypeDef emitName ctorRenames key def)
                 )
                 sortedKeys
 
@@ -950,9 +1092,9 @@ emitElm rootBe rootFe included unresolved forceExternal docsIndex =
 
         proofSourceRaw =
             if List.isEmpty allErrors && List.isEmpty finalUnresolved then
-                -- Use full `emittable` (incl. externalized package types) so samples can
-                -- construct OAuth.* / package values; externalized controls qualifiers.
-                emitProofElm rootBe rootFe emittable externalized docsIndex
+                -- Collapsed included keeps opaques + folded roots for sample invent;
+                -- `externalized` / `ctorRenames` control qualifiers and Class A renames.
+                emitProofElm rootBe rootFe includedCollapsed externalized ctorRenames docsIndex
 
             else
                 "module ProtocolWireProof exposing (suite)\n\nimport Test exposing (Test, test, describe)\nimport Expect\n\nsuite : Test\nsuite =\n    test \"extract incomplete\" <| \\_ -> Expect.fail \"Protocol extract had errors\"\n"
@@ -995,8 +1137,8 @@ build a minimal Protocol value and prove:
 
 with identical Wire3 byte lists (real Lamdera w3_* codecs).
 -}
-emitProofElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> String
-emitProofElm rootBe rootFe included externalized docsIndex =
+emitProofElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> DocsIndex -> String
+emitProofElm rootBe rootFe included externalized ctorRenames docsIndex =
     let
         allRefs =
             included
@@ -1126,34 +1268,42 @@ exampleUrl =
                 ""
 
         beSamples =
-            sampleConstructors rootBe included externalized docsIndex "ToBackend"
+            sampleConstructors rootBe included externalized ctorRenames docsIndex "ToBackend"
 
         feSamples =
-            sampleConstructors rootFe included externalized docsIndex "ToFrontend"
+            sampleConstructors rootFe included externalized ctorRenames docsIndex "ToFrontend"
 
         beList =
-            "allToBackend : List ( String, Protocol.ToBackend )\nallToBackend =\n    [ "
+            "allToBackend : List ( String, Protocol."
+                ++ rootEmitNameBe
+                ++ " )\nallToBackend =\n    [ "
                 ++ String.join "\n    , " beSamples
                 ++ "\n    ]\n"
 
         feList =
-            "allToFrontend : List ( String, Protocol.ToFrontend )\nallToFrontend =\n    [ "
+            "allToFrontend : List ( String, Protocol."
+                ++ rootEmitNameFe
+                ++ " )\nallToFrontend =\n    [ "
                 ++ String.join "\n    , " feSamples
                 ++ "\n    ]\n"
 
         beFuzz =
-            propertyFuzzers rootBe included externalized "ToBackend" "roundTripToBackend"
+            propertyFuzzers rootBe included externalized ctorRenames "ToBackend" "roundTripToBackend"
 
         feFuzz =
-            propertyFuzzers rootFe included externalized "ToFrontend" "roundTripToFrontend"
+            propertyFuzzers rootFe included externalized ctorRenames "ToFrontend" "roundTripToFrontend"
 
         body =
             """
-roundTripToBackend : Protocol.ToBackend -> Expectation
+roundTripToBackend : Protocol."""
+                ++ rootEmitNameBe
+                ++ """ -> Expectation
 roundTripToBackend protocolVal =
     let
         protocolBytes =
-            Wire3.bytesEncode (Protocol.w3_encode_ToBackend protocolVal)
+            Wire3.bytesEncode (Protocol.w3_encode_"""
+                ++ rootEmitNameBe
+                ++ """ protocolVal)
 
         protocolList =
             Wire3.intListFromBytes protocolBytes
@@ -1182,7 +1332,9 @@ roundTripToBackend protocolVal =
                     )
 
             else
-                case Wire3.bytesDecode Protocol.w3_decode_ToBackend appBytes of
+                case Wire3.bytesDecode Protocol.w3_decode_"""
+                ++ rootEmitNameBe
+                ++ """ appBytes of
                     Nothing ->
                         Expect.fail "Protocol failed to decode app ToBackend bytes"
 
@@ -1190,16 +1342,22 @@ roundTripToBackend protocolVal =
                         let
                             again =
                                 Wire3.intListFromBytes
-                                    (Wire3.bytesEncode (Protocol.w3_encode_ToBackend protocolVal2))
+                                    (Wire3.bytesEncode (Protocol.w3_encode_"""
+                ++ rootEmitNameBe
+                ++ """ protocolVal2))
                         in
                         Expect.equal protocolList again
 
 
-roundTripToFrontend : Protocol.ToFrontend -> Expectation
+roundTripToFrontend : Protocol."""
+                ++ rootEmitNameFe
+                ++ """ -> Expectation
 roundTripToFrontend protocolVal =
     let
         protocolBytes =
-            Wire3.bytesEncode (Protocol.w3_encode_ToFrontend protocolVal)
+            Wire3.bytesEncode (Protocol.w3_encode_"""
+                ++ rootEmitNameFe
+                ++ """ protocolVal)
 
         protocolList =
             Wire3.intListFromBytes protocolBytes
@@ -1228,7 +1386,9 @@ roundTripToFrontend protocolVal =
                     )
 
             else
-                case Wire3.bytesDecode Protocol.w3_decode_ToFrontend appBytes of
+                case Wire3.bytesDecode Protocol.w3_decode_"""
+                ++ rootEmitNameFe
+                ++ """ appBytes of
                     Nothing ->
                         Expect.fail "Protocol failed to decode app ToFrontend bytes"
 
@@ -1236,7 +1396,9 @@ roundTripToFrontend protocolVal =
                         let
                             again =
                                 Wire3.intListFromBytes
-                                    (Wire3.bytesEncode (Protocol.w3_encode_ToFrontend protocolVal2))
+                                    (Wire3.bytesEncode (Protocol.w3_encode_"""
+                ++ rootEmitNameFe
+                ++ """ protocolVal2))
                         in
                         Expect.equal protocolList again
 
@@ -1276,21 +1438,60 @@ suite =
         ++ body
 
 
-sampleConstructors : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> String -> List String
-sampleConstructors rootKey included externalized docsIndex rootLabel =
-    case Dict.get rootKey included of
-        Just (Custom { constructors }) ->
+{-| Follow type aliases to the underlying custom type (e.g. Types.ToBackend → Bridge.ToBackend).
+Wire roots are often aliases; samples must use the concrete constructors.
+-}
+resolveToCustom :
+    TypeKey
+    -> Dict TypeKey TypeDef
+    -> Maybe ( TypeKey, List Constructor )
+resolveToCustom key included =
+    resolveToCustomHelp key included Set.empty
+
+
+resolveToCustomHelp :
+    TypeKey
+    -> Dict TypeKey TypeDef
+    -> Set TypeKey
+    -> Maybe ( TypeKey, List Constructor )
+resolveToCustomHelp key included visiting =
+    if Set.member key visiting then
+        Nothing
+
+    else
+        case Dict.get key included of
+            Just (Custom { constructors }) ->
+                Just ( key, constructors )
+
+            Just (Alias { body }) ->
+                case body of
+                    Typed target _ ->
+                        resolveToCustomHelp (normalizeKey target) included (Set.insert key visiting)
+
+                    _ ->
+                        Nothing
+
+            Nothing ->
+                Nothing
+
+
+sampleConstructors : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> DocsIndex -> String -> List String
+sampleConstructors rootKey included externalized ctorRenames docsIndex rootLabel =
+    case resolveToCustom rootKey included of
+        Just ( customKey, constructors ) ->
             List.map
                 (\ctor ->
                     let
                         expr =
-                            minimalCtorExpr included externalized docsIndex rootKey ctor Dict.empty Set.empty
+                            -- Use customKey for ctor lookup; ctors of an alias target live on
+                            -- that type in Protocol (or external module), and Elm aliases share them.
+                            minimalCtorExpr included externalized ctorRenames docsIndex customKey ctor Dict.empty Set.empty
                     in
                     "( \"" ++ ctor.name ++ "\", " ++ expr ++ " )"
                 )
                 constructors
 
-        _ ->
+        Nothing ->
             [ "( \"MISSING\", " ++ unconstructable ("no " ++ rootLabel ++ " constructors") ++ " )" ]
 
 
@@ -1316,57 +1517,74 @@ type alias DocsCandidate =
 docsSampleScored : DocsIndex -> TypeKey -> List DocsCandidate
 docsSampleScored docsIndex typeKey =
     let
-        ( mod, _ ) =
+        ( mod, typeName ) =
             parseKey typeKey
 
         modStr =
             String.join "." mod
 
-        values : List ( String, DocsValue )
-        values =
-            let
-                fromHome =
-                    Dict.get modStr docsIndex
-                        |> Maybe.withDefault []
-                        |> List.map (\v -> ( modStr, v ))
+        scoreValues : List ( String, DocsValue ) -> List DocsCandidate
+        scoreValues values =
+            values
+                |> List.filterMap
+                    (\( moduleName, v ) ->
+                        let
+                            ( arity, params, result ) =
+                                peelFunction v.tipe
+                        in
+                        if resultMatchesType typeKey result then
+                            Just
+                                { score = sampleScore v.name arity
+                                , moduleName = moduleName
+                                , value = v
+                                , params = params
+                                }
 
-                fromAll =
-                    docsIndex
-                        |> Dict.toList
-                        |> List.concatMap
-                            (\( m, vs ) ->
-                                List.map (\v -> ( m, v )) vs
-                            )
-            in
-            if List.isEmpty fromHome then
-                fromAll
+                        else
+                            Nothing
+                    )
+                |> List.sortBy .score
 
-            else
-                fromHome
+        fromHome =
+            Dict.get modStr docsIndex
+                |> Maybe.withDefault []
+                |> List.map (\v -> ( modStr, v ))
+
+        homeScored =
+            scoreValues fromHome
+
+        -- Prefer related modules only (same suffix / contains type name). Avoid
+        -- full-index scans that blow the JS stack on large package graphs.
+        relatedModules =
+            docsIndex
+                |> Dict.keys
+                |> List.filter
+                    (\m ->
+                        m
+                            == modStr
+                            || String.endsWith ("." ++ typeName) m
+                            || String.endsWith typeName m
+                            || (not (List.isEmpty mod) && String.startsWith (Maybe.withDefault "" (List.head mod) ++ ".") m)
+                    )
     in
-    values
-        |> List.filterMap
-            (\( moduleName, v ) ->
-                let
-                    ( arity, params, result ) =
-                        peelFunction v.tipe
-                in
-                if resultMatchesType typeKey result then
-                    Just
-                        { score = sampleScore v.name arity
-                        , moduleName = moduleName
-                        , value = v
-                        , params = params
-                        }
+    -- Class B: if the home module has values but none match this type (or is empty),
+    -- scan related docs modules only.
+    if List.isEmpty homeScored then
+        relatedModules
+            |> List.concatMap
+                (\m ->
+                    Dict.get m docsIndex
+                        |> Maybe.withDefault []
+                        |> List.map (\v -> ( m, v ))
+                )
+            |> scoreValues
 
-                else
-                    Nothing
-            )
-        |> List.sortBy .score
+    else
+        homeScored
 
 
-docsSampleExpr : DocsIndex -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Set TypeKey -> Maybe String
-docsSampleExpr docsIndex included externalized typeKey visiting =
+docsSampleExpr : DocsIndex -> Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> TypeKey -> Set TypeKey -> Maybe String
+docsSampleExpr docsIndex included externalized ctorRenames typeKey visiting =
     docsSampleScored docsIndex typeKey
         |> List.filterMap
             (\best ->
@@ -1374,7 +1592,7 @@ docsSampleExpr docsIndex included externalized typeKey visiting =
                     argExprs =
                         List.map
                             (\p ->
-                                minimalAnnExpr included externalized docsIndex (fromDocsType p) visiting
+                                minimalAnnExpr included externalized ctorRenames docsIndex (fromDocsType p) visiting
                             )
                             best.params
                 in
@@ -1474,15 +1692,15 @@ sampleScore name arity =
 
 {-| Property-based tests for constructors whose args are fully fuzzable kernels.
 -}
-propertyFuzzers : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> String -> String -> String
-propertyFuzzers rootKey included externalized rootLabel roundTripFn =
-    case Dict.get rootKey included of
-        Just (Custom { constructors }) ->
+propertyFuzzers : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> String -> String -> String
+propertyFuzzers rootKey included externalized ctorRenames rootLabel roundTripFn =
+    case resolveToCustom rootKey included of
+        Just ( customKey, constructors ) ->
             let
                 tests =
                     List.filterMap
                         (\ctor ->
-                            case fuzzCtorExpr included externalized rootKey ctor of
+                            case fuzzCtorExpr included externalized ctorRenames customKey ctor of
                                 Just fuzzerExpr ->
                                     Just
                                         ("fuzz ("
@@ -1510,24 +1728,24 @@ propertyFuzzers rootKey included externalized rootLabel roundTripFn =
                     ++ String.join "\n            , " tests
                     ++ "\n            ]"
 
-        _ ->
+        Nothing ->
             ""
 
 
 {-| Build `Fuzz.mapN Ctor f1 f2...` or `Fuzz.constant Ctor` when all args fuzzable.
 -}
-fuzzCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Constructor -> Maybe String
-fuzzCtorExpr included externalized typeKey ctor =
+fuzzCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> TypeKey -> Constructor -> Maybe String
+fuzzCtorExpr included externalized ctorRenames typeKey ctor =
     let
         head =
-            ctorQualifier typeKey externalized ++ ctor.name
+            ctorQualifier typeKey externalized ctorRenames ctor.name
     in
     case ctor.args of
         [] ->
             Just ("Fuzz.constant " ++ head)
 
         args ->
-            case List.map (fuzzAnnExpr included externalized) args of
+            case List.map (fuzzAnnExpr included externalized ctorRenames) args of
                 fuzzers ->
                     if List.any ((==) Nothing) fuzzers then
                         Nothing
@@ -1558,8 +1776,8 @@ fuzzCtorExpr included externalized typeKey ctor =
                                 Nothing
 
 
-fuzzAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeAnn -> Maybe String
-fuzzAnnExpr included externalized ann =
+fuzzAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> TypeAnn -> Maybe String
+fuzzAnnExpr included externalized ctorRenames ann =
     case ann of
         Generic _ ->
             Nothing
@@ -1568,10 +1786,10 @@ fuzzAnnExpr included externalized ann =
             Just "Fuzz.constant ()"
 
         Typed key args ->
-            fuzzTypedExpr included externalized (normalizeKey key) args
+            fuzzTypedExpr included externalized ctorRenames (normalizeKey key) args
 
         Tupled items ->
-            case List.map (fuzzAnnExpr included externalized) items of
+            case List.map (fuzzAnnExpr included externalized ctorRenames) items of
                 fuzzers ->
                     if List.any ((==) Nothing) fuzzers then
                         Nothing
@@ -1595,7 +1813,7 @@ fuzzAnnExpr included externalized ann =
             -- only records of fuzzable kernels with 1-4 fields
             let
                 fieldFuzz =
-                    List.map (\( n, t ) -> ( n, fuzzAnnExpr included externalized t )) fields
+                    List.map (\( n, t ) -> ( n, fuzzAnnExpr included externalized ctorRenames t )) fields
             in
             if List.any (\( _, m ) -> m == Nothing) fieldFuzz then
                 Nothing
@@ -1645,8 +1863,8 @@ fuzzAnnExpr included externalized ann =
             Nothing
 
 
-fuzzTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> List TypeAnn -> Maybe String
-fuzzTypedExpr included externalized key args =
+fuzzTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> TypeKey -> List TypeAnn -> Maybe String
+fuzzTypedExpr included externalized ctorRenames key args =
     let
         ( mod, name ) =
             parseKey key
@@ -1672,7 +1890,7 @@ fuzzTypedExpr included externalized key args =
     else if name == "List" || key == "List" || modStr == "List" then
         case args of
             [ inner ] ->
-                fuzzAnnExpr included externalized inner
+                fuzzAnnExpr included externalized ctorRenames inner
                     |> Maybe.map (\f -> "Fuzz.list (" ++ f ++ ")")
 
             _ ->
@@ -1681,7 +1899,7 @@ fuzzTypedExpr included externalized key args =
     else if name == "Maybe" || key == "Maybe" || modStr == "Maybe" then
         case args of
             [ inner ] ->
-                fuzzAnnExpr included externalized inner
+                fuzzAnnExpr included externalized ctorRenames inner
                     |> Maybe.map (\f -> "Fuzz.maybe (" ++ f ++ ")")
 
             _ ->
@@ -1690,7 +1908,7 @@ fuzzTypedExpr included externalized key args =
     else if name == "Result" || key == "Result" || modStr == "Result" then
         case args of
             [ err, ok ] ->
-                case ( fuzzAnnExpr included externalized err, fuzzAnnExpr included externalized ok ) of
+                case ( fuzzAnnExpr included externalized ctorRenames err, fuzzAnnExpr included externalized ctorRenames ok ) of
                     ( Just fe, Just fo ) ->
                         Just
                             ("Fuzz.oneOf [ Fuzz.map Err ("
@@ -1715,7 +1933,7 @@ fuzzTypedExpr included externalized key args =
     else
         case Dict.get key included of
             Just (Alias { body }) ->
-                fuzzAnnExpr included externalized body
+                fuzzAnnExpr included externalized ctorRenames body
 
             Just (Custom { constructors }) ->
                 -- Only nullary-only enums are property-fuzzed as oneOf constants
@@ -1723,7 +1941,7 @@ fuzzTypedExpr included externalized key args =
                     let
                         constants =
                             List.map
-                                (\c -> "Fuzz.constant (" ++ ctorQualifier key externalized ++ c.name ++ ")")
+                                (\c -> "Fuzz.constant (" ++ ctorQualifier key externalized ctorRenames c.name ++ ")")
                                 constructors
                     in
                     Just ("Fuzz.oneOf [ " ++ String.join ", " constants ++ " ]")
@@ -1735,17 +1953,21 @@ fuzzTypedExpr included externalized key args =
                 Nothing
 
 
-ctorQualifier : TypeKey -> Set TypeKey -> String
-ctorQualifier typeKey externalized =
+ctorQualifier : TypeKey -> Set TypeKey -> Dict String String -> String -> String
+ctorQualifier typeKey externalized ctorRenames ctorName =
+    let
+        emitted =
+            emitCtorName ctorRenames typeKey ctorName
+    in
     if Set.member typeKey externalized then
         let
             ( mod, _ ) =
                 parseKey typeKey
         in
-        String.join "." mod ++ "."
+        String.join "." mod ++ "." ++ ctorName
 
     else
-        "Protocol."
+        "Protocol." ++ emitted
 
 
 {-| Map type-parameter names to the concrete TypeAnns they are applied with.
@@ -1792,11 +2014,11 @@ unconstructable reason =
     "Debug.todo \"wire-extractor cannot invent sample: " ++ reason ++ "\""
 
 
-minimalCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
-minimalCtorExpr included externalized docsIndex typeKey ctor subst visiting =
+minimalCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> DocsIndex -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
+minimalCtorExpr included externalized ctorRenames docsIndex typeKey ctor subst visiting =
     let
         head =
-            ctorQualifier typeKey externalized ++ ctor.name
+            ctorQualifier typeKey externalized ctorRenames ctor.name
 
         args =
             List.map (applySubst subst) ctor.args
@@ -1810,13 +2032,13 @@ minimalCtorExpr included externalized docsIndex typeKey ctor subst visiting =
                 ++ " "
                 ++ String.join " "
                     (List.map
-                        (\ann -> "(" ++ minimalAnnExpr included externalized docsIndex ann (Set.insert typeKey visiting) ++ ")")
+                        (\ann -> "(" ++ minimalAnnExpr included externalized ctorRenames docsIndex ann (Set.insert typeKey visiting) ++ ")")
                         args
                     )
 
 
-minimalAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> TypeAnn -> Set TypeKey -> String
-minimalAnnExpr included externalized docsIndex ann visiting =
+minimalAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> DocsIndex -> TypeAnn -> Set TypeKey -> String
+minimalAnnExpr included externalized ctorRenames docsIndex ann visiting =
     case ann of
         Generic name ->
             unconstructable ("unsubstituted type variable `" ++ name ++ "`")
@@ -1825,12 +2047,12 @@ minimalAnnExpr included externalized docsIndex ann visiting =
             "()"
 
         Typed key args ->
-            minimalTypedExpr included externalized docsIndex (normalizeKey key) args visiting
+            minimalTypedExpr included externalized ctorRenames docsIndex (normalizeKey key) args visiting
 
         Tupled items ->
             "("
                 ++ String.join ", "
-                    (List.map (\a -> minimalAnnExpr included externalized docsIndex a visiting) items)
+                    (List.map (\a -> minimalAnnExpr included externalized ctorRenames docsIndex a visiting) items)
                 ++ ")"
 
         Record fields ->
@@ -1842,21 +2064,21 @@ minimalAnnExpr included externalized docsIndex ann visiting =
                     ++ String.join ", "
                         (List.map
                             (\( n, t ) ->
-                                n ++ " = " ++ minimalAnnExpr included externalized docsIndex t visiting
+                                n ++ " = " ++ minimalAnnExpr included externalized ctorRenames docsIndex t visiting
                             )
                             fields
                         )
                     ++ " }"
 
         ExtensibleRecord _ fields ->
-            minimalAnnExpr included externalized docsIndex (Record fields) visiting
+            minimalAnnExpr included externalized ctorRenames docsIndex (Record fields) visiting
 
         Function _ _ ->
             unconstructable "function type on wire"
 
 
-minimalTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> TypeKey -> List TypeAnn -> Set TypeKey -> String
-minimalTypedExpr included externalized docsIndex key typeArgs visiting =
+minimalTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> Dict String String -> DocsIndex -> TypeKey -> List TypeAnn -> Set TypeKey -> String
+minimalTypedExpr included externalized ctorRenames docsIndex key typeArgs visiting =
     let
         ( mod, name ) =
             parseKey key
@@ -1889,7 +2111,7 @@ minimalTypedExpr included externalized docsIndex key typeArgs visiting =
     else if name == "Result" || key == "Result" || modStr == "Result" then
         case typeArgs of
             [ errAnn, _ ] ->
-                "Err (" ++ minimalAnnExpr included externalized docsIndex errAnn visiting ++ ")"
+                "Err (" ++ minimalAnnExpr included externalized ctorRenames docsIndex errAnn visiting ++ ")"
 
             _ ->
                 "Err \"\""
@@ -1940,7 +2162,7 @@ minimalTypedExpr included externalized docsIndex key typeArgs visiting =
 
             _ ->
                 -- Fall back to docs values on the module (rare for true kernels)
-                case docsSampleExpr docsIndex included externalized key visiting of
+                case docsSampleExpr docsIndex included externalized ctorRenames key visiting of
                     Just expr ->
                         expr
 
@@ -1952,7 +2174,7 @@ minimalTypedExpr included externalized docsIndex key typeArgs visiting =
             Just (Custom { constructors }) ->
                 case List.filter (\c -> List.isEmpty c.args) constructors of
                     c :: _ ->
-                        ctorQualifier key externalized ++ c.name
+                        ctorQualifier key externalized ctorRenames c.name
 
                     [] ->
                         unconstructable ("recursive type without nullary ctor: " ++ key)
@@ -1969,15 +2191,15 @@ minimalTypedExpr included externalized docsIndex key typeArgs visiting =
                 in
                 -- Prefer docs sample for unexpandable package aliases (Point3d → Geometry.Types)
                 if Set.member key externalized then
-                    case docsSampleExpr docsIndex included externalized key visiting of
+                    case docsSampleExpr docsIndex included externalized ctorRenames key visiting of
                         Just expr ->
                             expr
 
                         Nothing ->
-                            minimalAnnExpr included externalized docsIndex (applySubst subst body) visiting
+                            minimalAnnExpr included externalized ctorRenames docsIndex (applySubst subst body) visiting
 
                 else
-                    minimalAnnExpr included externalized docsIndex (applySubst subst body) visiting
+                    minimalAnnExpr included externalized ctorRenames docsIndex (applySubst subst body) visiting
 
             Just (Custom { constructors, generics }) ->
                 let
@@ -1998,7 +2220,7 @@ minimalTypedExpr included externalized docsIndex key typeArgs visiting =
                                         { name = "EMPTY", args = [] }
                 in
                 if chosen.name == "EMPTY" then
-                    case docsSampleExpr docsIndex included externalized key visiting of
+                    case docsSampleExpr docsIndex included externalized ctorRenames key visiting of
                         Just expr ->
                             expr
 
@@ -2007,18 +2229,18 @@ minimalTypedExpr included externalized docsIndex key typeArgs visiting =
 
                 else if Set.member key externalized && List.isEmpty chosen.args == False then
                     -- Opaque-ish package type with no public nullary: try docs first
-                    case docsSampleExpr docsIndex included externalized key visiting of
+                    case docsSampleExpr docsIndex included externalized ctorRenames key visiting of
                         Just expr ->
                             expr
 
                         Nothing ->
-                            minimalCtorExpr included externalized docsIndex key chosen subst visiting
+                            minimalCtorExpr included externalized ctorRenames docsIndex key chosen subst visiting
 
                 else
-                    minimalCtorExpr included externalized docsIndex key chosen subst visiting
+                    minimalCtorExpr included externalized ctorRenames docsIndex key chosen subst visiting
 
             Nothing ->
-                case docsSampleExpr docsIndex included externalized key visiting of
+                case docsSampleExpr docsIndex included externalized ctorRenames key visiting of
                     Just expr ->
                         expr
 
@@ -2114,8 +2336,8 @@ kernelImportLines keys =
         |> List.map importFor
 
 
-emitTypeDef : (TypeKey -> String) -> TypeKey -> TypeDef -> String
-emitTypeDef emitName key def =
+emitTypeDef : (TypeKey -> String) -> Dict String String -> TypeKey -> TypeDef -> String
+emitTypeDef emitName ctorRenames key def =
     let
         name =
             emitName key
@@ -2139,10 +2361,10 @@ emitTypeDef emitName key def =
                         ++ name
                         ++ genericsStr generics
                         ++ "\n    = "
-                        ++ emitConstructor emitName first
+                        ++ emitConstructor emitName ctorRenames key first
                         ++ String.concat
                             (List.map
-                                (\c -> "\n    | " ++ emitConstructor emitName c)
+                                (\c -> "\n    | " ++ emitConstructor emitName ctorRenames key c)
                                 rest
                             )
 
@@ -2154,14 +2376,18 @@ emitTypeDef emitName key def =
                 ++ emitAnn emitName body
 
 
-emitConstructor : (TypeKey -> String) -> Constructor -> String
-emitConstructor emitName ctor =
+emitConstructor : (TypeKey -> String) -> Dict String String -> TypeKey -> Constructor -> String
+emitConstructor emitName ctorRenames typeKey ctor =
+    let
+        cname =
+            emitCtorName ctorRenames typeKey ctor.name
+    in
     case ctor.args of
         [] ->
-            ctor.name
+            cname
 
         args ->
-            ctor.name ++ " " ++ String.join " " (List.map (emitAnnParens emitName) args)
+            cname ++ " " ++ String.join " " (List.map (emitAnnParens emitName) args)
 
 
 emitAnnParens : (TypeKey -> String) -> TypeAnn -> String
