@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * lamdera-protocol — freeze ToBackend/ToFrontend as one Protocol.elm module
+ * wire-extractor — freeze ToBackend/ToFrontend as one Protocol.elm module
  * and prove Wire3 identity with property-based tests.
  *
  * Commands:
@@ -16,11 +16,11 @@ const TOOL_ROOT = path.resolve(__dirname, "..");
 const REVIEW_CONFIG = path.join(TOOL_ROOT, "review");
 
 function usage() {
-  console.log(`lamdera-protocol — Wire3 protocol extract + proof for Lamdera apps
+  console.log(`wire-extractor — Wire3 protocol extract + proof for Lamdera apps
 
 Usage:
-  lamdera-protocol extract [--project DIR] [-o Protocol.elm] [--proof FILE] [--json]
-  lamdera-protocol prove   [--project DIR] [--tests-dir tests]
+  wire-extractor extract [--project DIR] [-o Protocol.elm] [--proof FILE] [--json]
+  wire-extractor prove   [--project DIR] [--tests-dir tests]
 
 extract
   Runs pure Elm (elm-review + elm-syntax) over the target app and writes

@@ -1,4 +1,4 @@
-# lamdera-protocol
+# wire-extractor
 
 Extract a **single `Protocol.elm`** module from any [Lamdera](https://lamdera.com) app containing only:
 
@@ -14,8 +14,8 @@ Analysis and codegen are **Elm** (`elm-review` + `elm-syntax` + `Elm.Docs`). Nod
 
 ```bash
 # clone / submodule
-git clone https://github.com/sjalq/lamdera-protocol.git
-# or: git submodule add https://github.com/sjalq/lamdera-protocol.git tools/lamdera-protocol
+git clone https://github.com/sjalq/wire-extractor.git
+# or: git submodule add https://github.com/sjalq/wire-extractor.git tools/wire-extractor
 
 # needs on PATH:
 #   elm-review (>= 2.10)
@@ -29,15 +29,15 @@ From a Lamdera app root (directory with `elm.json` and `Types.ToBackend` / `Type
 
 ```bash
 # Protocol only
-node path/to/lamdera-protocol/bin/lamdera-protocol.js extract -o Protocol.elm
+node path/to/wire-extractor/bin/wire-extractor.js extract -o Protocol.elm
 
 # Protocol + generated proof module
-node path/to/lamdera-protocol/bin/lamdera-protocol.js extract \
+node path/to/wire-extractor/bin/wire-extractor.js extract \
   -o tests/Protocol.elm \
   --proof tests/ProtocolWireProof.elm
 
 # Full prove: extract, write tests/, run property + exhaustive Wire3 proofs
-node path/to/lamdera-protocol/bin/lamdera-protocol.js prove --project .
+node path/to/wire-extractor/bin/wire-extractor.js prove --project .
 ```
 
 `prove` writes `tests/Protocol.elm` and `tests/ProtocolWireProof.elm`, ensures `tests/` is a source directory and `elm-explorations/test` is a test dependency, then runs:
@@ -50,10 +50,10 @@ elm-test-rs --compiler lamdera tests/ProtocolWireProof.elm
 
 For each `ToBackend` / `ToFrontend` constructor (minimal payload) **and** property-fuzzed constructors with kernel-only args:
 
-1. `Protocol.w3_encode_*` → bytes  
-2. `Types.w3_decode_*` succeeds  
-3. `Types.w3_encode_*` → **same** Wire3 byte list  
-4. `Protocol.w3_decode_*` succeeds and re-encodes to the same bytes  
+1. `Protocol.w3_encode_*` → bytes
+2. `Types.w3_decode_*` succeeds
+3. `Types.w3_encode_*` → **same** Wire3 byte list
+4. `Protocol.w3_decode_*` succeeds and re-encodes to the same bytes
 
 Codecs are the real Lamdera-generated `w3_*` functions, not hand-rolled serializers.
 
@@ -73,8 +73,8 @@ If two **project** types on the wire share a constructor name (e.g. both define 
 ## Layout
 
 ```
-bin/lamdera-protocol.js     # CLI (extract | prove)
-review/                     # elm-review project (all analysis/codegen)
+bin/wire-extractor.js     # CLI (extract | prove)
+review/                   # elm-review project (all analysis/codegen)
   src/
     ReviewConfig.elm
     ExtractWireProtocol.elm # rule + JSON extract
