@@ -5,7 +5,7 @@ import Elm.Docs as Docs
 import Elm.Syntax.Declaration as Declaration exposing (Declaration)
 import Elm.Syntax.Node as Node exposing (Node)
 import Json.Encode as Encode
-import ProtocolIR exposing (TypeDef, TypeKey)
+import ProtocolIR exposing (DocsIndex, TypeDef, TypeKey)
 import Review.ModuleNameLookupTable as ModuleNameLookupTable exposing (ModuleNameLookupTable)
 import Review.Project.Dependency as Dependency exposing (Dependency)
 import Review.Rule as Rule exposing (Error, Rule)
@@ -17,6 +17,7 @@ import Review.Rule as Rule exposing (Error, Rule)
 
 type alias ProjectContext =
     { types : Dict TypeKey TypeDef
+    , docsIndex : DocsIndex
     }
 
 
@@ -30,6 +31,7 @@ type alias ModuleContext =
 initialProjectContext : ProjectContext
 initialProjectContext =
     { types = Dict.empty
+    , docsIndex = Dict.empty
     }
 
 
@@ -70,10 +72,18 @@ dependenciesVisitor deps context =
                 |> Dict.values
                 |> List.concatMap Dependency.modules
 
-        indexed =
+        indexedTypes =
             List.foldl indexDocsModule context.types docsModules
+
+        indexedValues =
+            List.foldl ProtocolIR.indexDocsValues context.docsIndex docsModules
     in
-    ( [], { context | types = indexed } )
+    ( []
+    , { context
+        | types = indexedTypes
+        , docsIndex = indexedValues
+      }
+    )
 
 
 indexDocsModule : Docs.Module -> Dict TypeKey TypeDef -> Dict TypeKey TypeDef
@@ -127,13 +137,17 @@ fromModuleToProject : Rule.ContextCreator ModuleContext ProjectContext
 fromModuleToProject =
     Rule.initContextCreator
         (\moduleContext ->
-            { types = moduleContext.types }
+            { types = moduleContext.types
+            , docsIndex = Dict.empty
+            }
         )
 
 
 foldProjectContexts : ProjectContext -> ProjectContext -> ProjectContext
 foldProjectContexts a b =
-    { types = Dict.union a.types b.types }
+    { types = Dict.union a.types b.types
+    , docsIndex = Dict.union a.docsIndex b.docsIndex
+    }
 
 
 
@@ -151,7 +165,6 @@ declarationListVisitor declarations context =
 
 collectDeclaration : ModuleContext -> Node Declaration -> Dict TypeKey TypeDef -> Dict TypeKey TypeDef
 collectDeclaration context node acc =
-    -- Skip Evergreen versions so roots resolve to live Types.*
     if List.member "Evergreen" context.moduleName then
         acc
 
@@ -201,7 +214,12 @@ dataExtractor projectContext =
                     ProtocolIR.closeFromRoots projectContext.types rootBe rootFe
 
                 emitted =
-                    ProtocolIR.emitElm rootBe rootFe included unresolved forceExternal
+                    ProtocolIR.emitElm rootBe
+                        rootFe
+                        included
+                        unresolved
+                        forceExternal
+                        projectContext.docsIndex
 
                 problemParts =
                     List.filter (not << String.isEmpty)

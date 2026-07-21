@@ -1,5 +1,7 @@
 module ProtocolIR exposing
-    ( Emitted
+    ( DocsIndex
+    , DocsValue
+    , Emitted
     , TypeDef
     , TypeKey
     , closeFromRoots
@@ -7,6 +9,7 @@ module ProtocolIR exposing
     , findRoots
     , fromDocsAlias
     , fromDocsUnion
+    , indexDocsValues
     , fromSyntaxAlias
     , fromSyntaxCustom
     )
@@ -33,6 +36,38 @@ import Set exposing (Set)
 -}
 type alias TypeKey =
     String
+
+
+{-| Package docs values, keyed by module name (e.g. \"Point3d\", \"SeqDict\").
+Used to invent samples for opaque / externalized types without hardcoding libraries.
+-}
+type alias DocsValue =
+    { name : String
+    , tipe : ElmType.Type
+    }
+
+
+type alias DocsIndex =
+    Dict String (List DocsValue)
+
+
+indexDocsValues : Docs.Module -> DocsIndex -> DocsIndex
+indexDocsValues docsModule acc =
+    let
+        values =
+            List.map
+                (\v ->
+                    { name = v.name
+                    , tipe = v.tipe
+                    }
+                )
+                docsModule.values
+    in
+    if List.isEmpty values then
+        acc
+
+    else
+        Dict.insert docsModule.name values acc
 
 
 makeKey : List String -> String -> TypeKey
@@ -797,8 +832,8 @@ externalImportLines keys =
             )
 
 
-emitElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> List TypeKey -> Set TypeKey -> Emitted
-emitElm rootBe rootFe included unresolved forceExternal =
+emitElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> List TypeKey -> Set TypeKey -> DocsIndex -> Emitted
+emitElm rootBe rootFe included unresolved forceExternal docsIndex =
     let
         rootModule =
             Tuple.first (parseKey rootBe)
@@ -916,7 +951,7 @@ emitElm rootBe rootFe included unresolved forceExternal =
             if List.isEmpty allErrors && List.isEmpty finalUnresolved then
                 -- Use full `emittable` (incl. externalized package types) so samples can
                 -- construct OAuth.* / package values; externalized controls qualifiers.
-                emitProofElm rootBe rootFe emittable externalized
+                emitProofElm rootBe rootFe emittable externalized docsIndex
 
             else
                 "module ProtocolWireProof exposing (suite)\n\nimport Test exposing (Test, test, describe)\nimport Expect\n\nsuite : Test\nsuite =\n    test \"extract incomplete\" <| \\_ -> Expect.fail \"Protocol extract had errors\"\n"
@@ -959,8 +994,8 @@ build a minimal Protocol value and prove:
 
 with identical Wire3 byte lists (real Lamdera w3_* codecs).
 -}
-emitProofElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> String
-emitProofElm rootBe rootFe included externalized =
+emitProofElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> String
+emitProofElm rootBe rootFe included externalized docsIndex =
     let
         allRefs =
             included
@@ -1090,10 +1125,10 @@ exampleUrl =
                 ""
 
         beSamples =
-            sampleConstructors rootBe included externalized "ToBackend"
+            sampleConstructors rootBe included externalized docsIndex "ToBackend"
 
         feSamples =
-            sampleConstructors rootFe included externalized "ToFrontend"
+            sampleConstructors rootFe included externalized docsIndex "ToFrontend"
 
         beList =
             "allToBackend : List ( String, Protocol.ToBackend )\nallToBackend =\n    [ "
@@ -1240,15 +1275,15 @@ suite =
         ++ body
 
 
-sampleConstructors : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> String -> List String
-sampleConstructors rootKey included externalized rootLabel =
+sampleConstructors : TypeKey -> Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> String -> List String
+sampleConstructors rootKey included externalized docsIndex rootLabel =
     case Dict.get rootKey included of
         Just (Custom { constructors }) ->
             List.map
                 (\ctor ->
                     let
                         expr =
-                            minimalCtorExpr included externalized rootKey ctor Dict.empty Set.empty
+                            minimalCtorExpr included externalized docsIndex rootKey ctor Dict.empty Set.empty
                     in
                     "( \"" ++ ctor.name ++ "\", " ++ expr ++ " )"
                 )
@@ -1256,6 +1291,139 @@ sampleConstructors rootKey included externalized rootLabel =
 
         _ ->
             [ "( \"MISSING\", " ++ unconstructable ("no " ++ rootLabel ++ " constructors") ++ " )" ]
+
+
+{-| Prefer nullary docs values (empty/origin/…), then unary from* with inventable args.
+-}
+docsSampleExpr : DocsIndex -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Set TypeKey -> Maybe String
+docsSampleExpr docsIndex included externalized typeKey visiting =
+    let
+        ( mod, typeName ) =
+            parseKey typeKey
+
+        modStr =
+            String.join "." mod
+
+        values =
+            Dict.get modStr docsIndex
+                |> Maybe.withDefault []
+
+        scored : List ( Int, DocsValue, List ElmType.Type )
+        scored =
+            values
+                |> List.filterMap
+                    (\v ->
+                        let
+                            ( arity, params, result ) =
+                                peelFunction v.tipe
+                        in
+                        if resultMatchesType typeKey result then
+                            Just ( sampleScore v.name arity, v, params )
+
+                        else
+                            Nothing
+                    )
+                |> List.sortBy (\( score, _, _ ) -> score)
+    in
+    case scored of
+        ( _, v, params ) :: _ ->
+            let
+                argExprs =
+                    List.map
+                        (\p ->
+                            minimalAnnExpr included externalized docsIndex (fromDocsType p) visiting
+                        )
+                        params
+            in
+            if List.any (String.contains "Debug.todo") argExprs then
+                Nothing
+
+            else
+                let
+                    qualified =
+                        if String.isEmpty modStr then
+                            v.name
+
+                        else
+                            modStr ++ "." ++ v.name
+                in
+                case argExprs of
+                    [] ->
+                        Just qualified
+
+                    args ->
+                        Just (qualified ++ " " ++ String.join " " (List.map (\a -> "(" ++ a ++ ")") args))
+
+        [] ->
+            Nothing
+
+
+peelFunction : ElmType.Type -> ( Int, List ElmType.Type, ElmType.Type )
+peelFunction tipe =
+    case tipe of
+        ElmType.Lambda a b ->
+            let
+                ( n, ps, r ) =
+                    peelFunction b
+            in
+            ( n + 1, a :: ps, r )
+
+        other ->
+            ( 0, [], other )
+
+
+resultMatchesType : TypeKey -> ElmType.Type -> Bool
+resultMatchesType typeKey result =
+    case result of
+        ElmType.Type docsName _ ->
+            let
+                ( mod, name ) =
+                    parseKey typeKey
+
+                dotted =
+                    case mod of
+                        [] ->
+                            name
+
+                        _ ->
+                            String.join "." mod ++ "." ++ name
+            in
+            docsName
+                == dotted
+                || docsName
+                == name
+                || String.endsWith ("." ++ name) docsName
+
+        _ ->
+            False
+
+
+sampleScore : String -> Int -> Int
+sampleScore name arity =
+    let
+        preferred =
+            [ "empty"
+            , "origin"
+            , "zero"
+            , "unit"
+            , "identity"
+            , "default"
+            , "init"
+            , "none"
+            , "null"
+            ]
+
+        nameRank =
+            if List.member name preferred then
+                0
+
+            else if String.startsWith "from" name || String.startsWith "singleton" name then
+                10
+
+            else
+                20
+    in
+    arity * 100 + nameRank
 
 
 {-| Property-based tests for constructors whose args are fully fuzzable kernels.
@@ -1578,8 +1746,8 @@ unconstructable reason =
     "Debug.todo \"wire-extractor cannot invent sample: " ++ reason ++ "\""
 
 
-minimalCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
-minimalCtorExpr included externalized typeKey ctor subst visiting =
+minimalCtorExpr : Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
+minimalCtorExpr included externalized docsIndex typeKey ctor subst visiting =
     let
         head =
             ctorQualifier typeKey externalized ++ ctor.name
@@ -1596,13 +1764,13 @@ minimalCtorExpr included externalized typeKey ctor subst visiting =
                 ++ " "
                 ++ String.join " "
                     (List.map
-                        (\ann -> "(" ++ minimalAnnExpr included externalized ann (Set.insert typeKey visiting) ++ ")")
+                        (\ann -> "(" ++ minimalAnnExpr included externalized docsIndex ann (Set.insert typeKey visiting) ++ ")")
                         args
                     )
 
 
-minimalAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeAnn -> Set TypeKey -> String
-minimalAnnExpr included externalized ann visiting =
+minimalAnnExpr : Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> TypeAnn -> Set TypeKey -> String
+minimalAnnExpr included externalized docsIndex ann visiting =
     case ann of
         Generic name ->
             unconstructable ("unsubstituted type variable `" ++ name ++ "`")
@@ -1611,12 +1779,12 @@ minimalAnnExpr included externalized ann visiting =
             "()"
 
         Typed key args ->
-            minimalTypedExpr included externalized (normalizeKey key) args visiting
+            minimalTypedExpr included externalized docsIndex (normalizeKey key) args visiting
 
         Tupled items ->
             "("
                 ++ String.join ", "
-                    (List.map (\a -> minimalAnnExpr included externalized a visiting) items)
+                    (List.map (\a -> minimalAnnExpr included externalized docsIndex a visiting) items)
                 ++ ")"
 
         Record fields ->
@@ -1628,21 +1796,21 @@ minimalAnnExpr included externalized ann visiting =
                     ++ String.join ", "
                         (List.map
                             (\( n, t ) ->
-                                n ++ " = " ++ minimalAnnExpr included externalized t visiting
+                                n ++ " = " ++ minimalAnnExpr included externalized docsIndex t visiting
                             )
                             fields
                         )
                     ++ " }"
 
         ExtensibleRecord _ fields ->
-            minimalAnnExpr included externalized (Record fields) visiting
+            minimalAnnExpr included externalized docsIndex (Record fields) visiting
 
         Function _ _ ->
             unconstructable "function type on wire"
 
 
-minimalTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> List TypeAnn -> Set TypeKey -> String
-minimalTypedExpr included externalized key typeArgs visiting =
+minimalTypedExpr : Dict TypeKey TypeDef -> Set TypeKey -> DocsIndex -> TypeKey -> List TypeAnn -> Set TypeKey -> String
+minimalTypedExpr included externalized docsIndex key typeArgs visiting =
     let
         ( mod, name ) =
             parseKey key
@@ -1675,7 +1843,7 @@ minimalTypedExpr included externalized key typeArgs visiting =
     else if name == "Result" || key == "Result" || modStr == "Result" then
         case typeArgs of
             [ errAnn, _ ] ->
-                "Err (" ++ minimalAnnExpr included externalized errAnn visiting ++ ")"
+                "Err (" ++ minimalAnnExpr included externalized docsIndex errAnn visiting ++ ")"
 
             _ ->
                 "Err \"\""
@@ -1688,9 +1856,6 @@ minimalTypedExpr included externalized key typeArgs visiting =
 
     else if name == "Array" || modStr == "Array" then
         "Array.empty"
-
-    else if name == "SeqDict" || modStr == "SeqDict" then
-        "SeqDict.empty"
 
     else if key == "Url" || key == "Url.Url" || (modStr == "Url" && name == "Url") then
         "exampleUrl"
@@ -1711,12 +1876,7 @@ minimalTypedExpr included externalized key typeArgs visiting =
         "Time.CE"
 
     else if name == "Error" && (modStr == "Http" || modStr == "Effect.Http") then
-        if modStr == "Effect.Http" || String.contains "Effect.Http" key then
-            -- Effect.Http.Error mirrors Http; prefer BadUrl if exposed similarly
-            "Http.BadUrl \"\""
-
-        else
-            "Http.BadUrl \"\""
+        "Http.BadUrl \"\""
 
     else if key == "Bytes.Bytes" || (modStr == "Bytes" && name == "Bytes") then
         "Bytes.fromList []"
@@ -1727,27 +1887,19 @@ minimalTypedExpr included externalized key typeArgs visiting =
     else if key == "Order" || name == "Order" then
         "EQ"
 
-    -- Lamdera program-test IDs are opaque; public helpers construct them
-    else if name == "SessionId" && (String.contains "Lamdera" modStr || modStr == "Lamdera") then
-        "Effect.Lamdera.sessionIdFromString \"\""
-
-    else if name == "ClientId" && (String.contains "Lamdera" modStr || modStr == "Lamdera") then
-        "Effect.Lamdera.clientIdFromString \"\""
-
-    -- elm-geometry points (public API; underlying Geometry.Types is unexposed)
-    else if name == "Point3d" then
-        "Point3d.origin"
-
-    else if name == "Point2d" then
-        "Point2d.origin"
-
     else if isKernelKey key then
         case name of
             "Value" ->
                 "Encode.null"
 
             _ ->
-                unconstructable ("kernel type " ++ key)
+                -- Fall back to docs values on the module (rare for true kernels)
+                case docsSampleExpr docsIndex included externalized key visiting of
+                    Just expr ->
+                        expr
+
+                    Nothing ->
+                        unconstructable ("kernel type " ++ key)
 
     else if Set.member key visiting then
         case Dict.get key included of
@@ -1769,7 +1921,17 @@ minimalTypedExpr included externalized key typeArgs visiting =
                     subst =
                         makeSubst generics typeArgs
                 in
-                minimalAnnExpr included externalized (applySubst subst body) visiting
+                -- Prefer docs sample for unexpandable package aliases (Point3d → Geometry.Types)
+                if Set.member key externalized then
+                    case docsSampleExpr docsIndex included externalized key visiting of
+                        Just expr ->
+                            expr
+
+                        Nothing ->
+                            minimalAnnExpr included externalized docsIndex (applySubst subst body) visiting
+
+                else
+                    minimalAnnExpr included externalized docsIndex (applySubst subst body) visiting
 
             Just (Custom { constructors, generics }) ->
                 let
@@ -1790,33 +1952,36 @@ minimalTypedExpr included externalized key typeArgs visiting =
                                         { name = "EMPTY", args = [] }
                 in
                 if chosen.name == "EMPTY" then
-                    unconstructable ("no constructors for " ++ key)
+                    case docsSampleExpr docsIndex included externalized key visiting of
+                        Just expr ->
+                            expr
+
+                        Nothing ->
+                            unconstructable ("no constructors for " ++ key)
+
+                else if Set.member key externalized && List.isEmpty chosen.args == False then
+                    -- Opaque-ish package type with no public nullary: try docs first
+                    case docsSampleExpr docsIndex included externalized key visiting of
+                        Just expr ->
+                            expr
+
+                        Nothing ->
+                            minimalCtorExpr included externalized docsIndex key chosen subst visiting
 
                 else
-                    minimalCtorExpr included externalized key chosen subst visiting
+                    minimalCtorExpr included externalized docsIndex key chosen subst visiting
 
             Nothing ->
-                -- Externalized / package types with known construction patterns
-                if name == "SessionId" then
-                    "Effect.Lamdera.sessionIdFromString \"\""
+                case docsSampleExpr docsIndex included externalized key visiting of
+                    Just expr ->
+                        expr
 
-                else if name == "ClientId" then
-                    "Effect.Lamdera.clientIdFromString \"\""
+                    Nothing ->
+                        if name == "Posix" then
+                            "Time.millisToPosix 0"
 
-                else if name == "Posix" then
-                    "Time.millisToPosix 0"
-
-                else if name == "Point3d" then
-                    "Point3d.origin"
-
-                else if name == "Point2d" then
-                    "Point2d.origin"
-
-                else if Set.member key externalized then
-                    unconstructable ("externalized type without sample rule: " ++ key)
-
-                else
-                    unconstructable ("unknown type " ++ key)
+                        else
+                            unconstructable ("no docs sample for " ++ key)
 
 
 formatExposing : String -> String
