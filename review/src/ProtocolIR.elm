@@ -501,14 +501,37 @@ findRoots index =
                         )
 
 
-closeFromRoots : Dict TypeKey TypeDef -> TypeKey -> TypeKey -> ( Dict TypeKey TypeDef, List TypeKey )
+{-| Public package alias whose body points at an unexposed module type
+(e.g. Point3d → Geometry.Types.Point3d). Cannot inline; import the public name.
+-}
+isUnexpandablePackageAlias : Dict TypeKey TypeDef -> TypeDef -> Bool
+isUnexpandablePackageAlias index def =
+    case def of
+        Alias { body } ->
+            case body of
+                Typed targetKey _ ->
+                    let
+                        target =
+                            normalizeKey targetKey
+                    in
+                    not (isKernelKey target)
+                        && not (Dict.member target index)
+
+                _ ->
+                    False
+
+        Custom _ ->
+            False
+
+
+closeFromRoots : Dict TypeKey TypeDef -> TypeKey -> TypeKey -> ( Dict TypeKey TypeDef, List TypeKey, Set TypeKey )
 closeFromRoots index rootBe rootFe =
     let
-        step : List TypeKey -> Set TypeKey -> List TypeKey -> ( Set TypeKey, List TypeKey )
-        step worklist included unresolved =
+        step : List TypeKey -> Set TypeKey -> List TypeKey -> Set TypeKey -> ( Set TypeKey, List TypeKey, Set TypeKey )
+        step worklist included unresolved forceExternal =
             case worklist of
                 [] ->
-                    ( included, unresolved )
+                    ( included, unresolved, forceExternal )
 
                 key0 :: rest ->
                     let
@@ -516,28 +539,45 @@ closeFromRoots index rootBe rootFe =
                             normalizeKey key0
                     in
                     if Set.member key included then
-                        step rest included unresolved
+                        step rest included unresolved forceExternal
 
                     else if isKernelKey key then
-                        step rest included unresolved
+                        step rest included unresolved forceExternal
 
                     else
                         case Dict.get key index of
                             Nothing ->
-                                step rest included (key :: unresolved)
+                                step rest included (key :: unresolved) forceExternal
 
                             Just def ->
                                 let
-                                    refs =
-                                        typeDefRefs def
-                                            |> List.map normalizeKey
-                                            |> List.filter (\r -> not (isKernelKey r))
-                                            |> List.filter (\r -> not (Set.member r included))
-                                in
-                                step (rest ++ refs) (Set.insert key included) unresolved
+                                    packageAlias =
+                                        isUnexpandablePackageAlias index def
 
-        ( includedSet, unresolvedList ) =
-            step [ rootBe, rootFe ] Set.empty []
+                                    refs =
+                                        if packageAlias then
+                                            -- Do not chase unexposed Geometry.Types.*; use-site
+                                            -- type args (Meters, WorldCoordinates) are enqueued
+                                            -- separately from Typed applications.
+                                            []
+
+                                        else
+                                            typeDefRefs def
+                                                |> List.map normalizeKey
+                                                |> List.filter (\r -> not (isKernelKey r))
+                                                |> List.filter (\r -> not (Set.member r included))
+
+                                    forceExternal2 =
+                                        if packageAlias then
+                                            Set.insert key forceExternal
+
+                                        else
+                                            forceExternal
+                                in
+                                step (rest ++ refs) (Set.insert key included) unresolved forceExternal2
+
+        ( includedSet, unresolvedList, forceExternalSet ) =
+            step [ rootBe, rootFe ] Set.empty [] Set.empty
 
         includedDict =
             includedSet
@@ -549,7 +589,7 @@ closeFromRoots index rootBe rootFe =
                     )
                 |> Dict.fromList
     in
-    ( includedDict, List.sort (unique unresolvedList) )
+    ( includedDict, List.sort (unique unresolvedList), forceExternalSet )
 
 
 unique : List comparable -> List comparable
@@ -757,8 +797,8 @@ externalImportLines keys =
             )
 
 
-emitElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> List TypeKey -> Emitted
-emitElm rootBe rootFe included unresolved =
+emitElm : TypeKey -> TypeKey -> Dict TypeKey TypeDef -> List TypeKey -> Set TypeKey -> Emitted
+emitElm rootBe rootFe included unresolved forceExternal =
     let
         rootModule =
             Tuple.first (parseKey rootBe)
@@ -771,8 +811,9 @@ emitElm rootBe rootFe included unresolved =
                 |> List.filter (\( _, def ) -> isOpaqueCustom def)
                 |> List.map Tuple.first
                 |> Set.fromList
+                |> Set.union forceExternal
 
-        -- Drop opaques from emit set; they will be imported as externalized.
+        -- Drop opaques / unexpandable package aliases; import instead.
         emittable : Dict TypeKey TypeDef
         emittable =
             Set.foldl Dict.remove included opaqueKeys
@@ -1693,6 +1734,13 @@ minimalTypedExpr included externalized key typeArgs visiting =
     else if name == "ClientId" && (String.contains "Lamdera" modStr || modStr == "Lamdera") then
         "Effect.Lamdera.clientIdFromString \"\""
 
+    -- elm-geometry points (public API; underlying Geometry.Types is unexposed)
+    else if name == "Point3d" then
+        "Point3d.origin"
+
+    else if name == "Point2d" then
+        "Point2d.origin"
+
     else if isKernelKey key then
         case name of
             "Value" ->
@@ -1757,6 +1805,12 @@ minimalTypedExpr included externalized key typeArgs visiting =
 
                 else if name == "Posix" then
                     "Time.millisToPosix 0"
+
+                else if name == "Point3d" then
+                    "Point3d.origin"
+
+                else if name == "Point2d" then
+                    "Point2d.origin"
 
                 else if Set.member key externalized then
                     unconstructable ("externalized type without sample rule: " ++ key)

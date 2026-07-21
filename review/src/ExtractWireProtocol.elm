@@ -197,11 +197,11 @@ dataExtractor projectContext =
 
         Ok ( rootBe, rootFe ) ->
             let
-                ( included, unresolved ) =
+                ( included, unresolved, forceExternal ) =
                     ProtocolIR.closeFromRoots projectContext.types rootBe rootFe
 
                 emitted =
-                    ProtocolIR.emitElm rootBe rootFe included unresolved
+                    ProtocolIR.emitElm rootBe rootFe included unresolved forceExternal
 
                 problemParts =
                     List.filter (not << String.isEmpty)
