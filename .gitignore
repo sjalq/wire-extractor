@@ -1,0 +1,10 @@
+elm-stuff/
+node_modules/
+.DS_Store
+*.elmi
+*.elmo
+review/elm-stuff/
+.proof-runs/
+*.bak
+.env
+.env.*

@@ -1,0 +1,34 @@
+{
+  "name": "lamdera-protocol",
+  "version": "1.0.0",
+  "description": "Extract ToBackend/ToFrontend wire protocol from any Lamdera app and prove Wire3 identity with property tests",
+  "license": "MIT",
+  "bin": {
+    "lamdera-protocol": "./bin/lamdera-protocol.js"
+  },
+  "files": [
+    "bin/",
+    "review/src/",
+    "review/elm.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sjalq/lamdera-protocol.git"
+  },
+  "keywords": [
+    "lamdera",
+    "elm",
+    "wire3",
+    "protocol",
+    "elm-review",
+    "elm-syntax"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "peerDependencies": {
+    "elm-review": ">=2.10.0"
+  }
+}
