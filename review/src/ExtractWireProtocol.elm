@@ -256,4 +256,5 @@ dataExtractor projectContext =
                 , ( "errors", Encode.list Encode.string emitted.errors )
                 , ( "includedCount", Encode.int (List.length emitted.included) )
                 , ( "indexCount", Encode.int (Dict.size projectContext.types) )
+                , ( "docsModuleCount", Encode.int (Dict.size projectContext.docsIndex) )
                 ]

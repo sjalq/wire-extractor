@@ -1304,36 +1304,60 @@ docsSampleExpr docsIndex included externalized typeKey visiting =
         modStr =
             String.join "." mod
 
+        -- Prefer the type's own module; fall back to scanning all package docs
+        -- (handles re-exports and odd module placement).
+        values : List ( String, DocsValue )
         values =
-            Dict.get modStr docsIndex
-                |> Maybe.withDefault []
+            let
+                fromHome =
+                    Dict.get modStr docsIndex
+                        |> Maybe.withDefault []
+                        |> List.map (\v -> ( modStr, v ))
 
-        scored : List ( Int, DocsValue, List ElmType.Type )
+                fromAll =
+                    docsIndex
+                        |> Dict.toList
+                        |> List.concatMap
+                            (\( m, vs ) ->
+                                List.map (\v -> ( m, v )) vs
+                            )
+            in
+            if List.isEmpty fromHome then
+                fromAll
+
+            else
+                fromHome
+
         scored =
             values
                 |> List.filterMap
-                    (\v ->
+                    (\( moduleName, v ) ->
                         let
                             ( arity, params, result ) =
                                 peelFunction v.tipe
                         in
                         if resultMatchesType typeKey result then
-                            Just ( sampleScore v.name arity, v, params )
+                            Just
+                                { score = sampleScore v.name arity
+                                , moduleName = moduleName
+                                , value = v
+                                , params = params
+                                }
 
                         else
                             Nothing
                     )
-                |> List.sortBy (\( score, _, _ ) -> score)
+                |> List.sortBy .score
     in
     case scored of
-        ( _, v, params ) :: _ ->
+        best :: _ ->
             let
                 argExprs =
                     List.map
                         (\p ->
                             minimalAnnExpr included externalized docsIndex (fromDocsType p) visiting
                         )
-                        params
+                        best.params
             in
             if List.any (String.contains "Debug.todo") argExprs then
                 Nothing
@@ -1341,11 +1365,11 @@ docsSampleExpr docsIndex included externalized typeKey visiting =
             else
                 let
                     qualified =
-                        if String.isEmpty modStr then
-                            v.name
+                        if String.isEmpty best.moduleName then
+                            best.value.name
 
                         else
-                            modStr ++ "." ++ v.name
+                            best.moduleName ++ "." ++ best.value.name
                 in
                 case argExprs of
                     [] ->
