@@ -751,7 +751,9 @@ externalImportLines keys =
                     Nothing
 
                 else
-                    Just ("import " ++ modStr ++ " exposing (" ++ name ++ "(..))")
+                    -- Never force (..): many package types are opaque. Expose the type
+                    -- name only; samples use public constructors/helpers when known.
+                    Just ("import " ++ modStr ++ " exposing (" ++ name ++ ")")
             )
 
 
@@ -869,7 +871,7 @@ emitElm rootBe rootFe included unresolved =
                     ++ importBlock
                     ++ body
 
-        proofSource =
+        proofSourceRaw =
             if List.isEmpty allErrors && List.isEmpty finalUnresolved then
                 -- Use full `emittable` (incl. externalized package types) so samples can
                 -- construct OAuth.* / package values; externalized controls qualifiers.
@@ -877,6 +879,27 @@ emitElm rootBe rootFe included unresolved =
 
             else
                 "module ProtocolWireProof exposing (suite)\n\nimport Test exposing (Test, test, describe)\nimport Expect\n\nsuite : Test\nsuite =\n    test \"extract incomplete\" <| \\_ -> Expect.fail \"Protocol extract had errors\"\n"
+
+        sampleTodos =
+            proofSourceRaw
+                |> String.indexes "Debug.todo \"wire-extractor cannot invent sample:"
+                |> List.length
+
+        sampleErrors =
+            if sampleTodos > 0 then
+                [ "Proof sample generation hit "
+                    ++ String.fromInt sampleTodos
+                    ++ " unconstructable nested type(s) (see Debug.todo in ProtocolWireProof). Common causes: unsubstituted type variables, opaque package types without empty/helpers, recursive DUs with no nullary constructor."
+                ]
+
+            else
+                []
+
+        proofSource =
+            proofSourceRaw
+
+        finalErrors =
+            allErrors ++ sampleErrors
     in
     { elmSource = source
     , proofElmSource = proofSource
@@ -884,7 +907,7 @@ emitElm rootBe rootFe included unresolved =
     , unresolved = finalUnresolved
     , rootToBackend = rootBe
     , rootToFrontend = rootFe
-    , errors = allErrors
+    , errors = finalErrors
     }
 
 
@@ -1184,14 +1207,14 @@ sampleConstructors rootKey emitName included externalized rootLabel =
                 (\ctor ->
                     let
                         expr =
-                            minimalCtorExpr emitName included externalized rootKey ctor Set.empty
+                            minimalCtorExpr emitName included externalized rootKey ctor Dict.empty Set.empty
                     in
                     "( \"" ++ ctor.name ++ "\", " ++ expr ++ " )"
                 )
                 constructors
 
         _ ->
-            [ "( \"MISSING\", Debug.todo \"no " ++ rootLabel ++ " constructors\" )" ]
+            [ "( \"MISSING\", " ++ unconstructable ("no " ++ rootLabel ++ " constructors") ++ " )" ]
 
 
 {-| Property-based tests for constructors whose args are fully fuzzable kernels.
@@ -1470,17 +1493,64 @@ ctorQualifier typeKey externalized =
         "Protocol."
 
 
-minimalCtorExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Constructor -> Set TypeKey -> String
-minimalCtorExpr emitName included externalized typeKey ctor visiting =
+{-| Map type-parameter names to the concrete TypeAnns they are applied with.
+e.g. Nonempty a applied as Nonempty PlanChanged → { "a" → PlanChanged }.
+-}
+type alias Subst =
+    Dict String TypeAnn
+
+
+makeSubst : List String -> List TypeAnn -> Subst
+makeSubst generics typeArgs =
+    List.map2 Tuple.pair generics typeArgs
+        |> Dict.fromList
+
+
+applySubst : Subst -> TypeAnn -> TypeAnn
+applySubst subst ann =
+    case ann of
+        Generic name ->
+            Dict.get name subst
+                |> Maybe.withDefault (Generic name)
+
+        Unit ->
+            Unit
+
+        Typed key args ->
+            Typed key (List.map (applySubst subst) args)
+
+        Tupled items ->
+            Tupled (List.map (applySubst subst) items)
+
+        Record fields ->
+            Record (List.map (\( n, t ) -> ( n, applySubst subst t )) fields)
+
+        ExtensibleRecord ext fields ->
+            ExtensibleRecord ext (List.map (\( n, t ) -> ( n, applySubst subst t )) fields)
+
+        Function a b ->
+            Function (applySubst subst a) (applySubst subst b)
+
+
+unconstructable : String -> String
+unconstructable reason =
+    "Debug.todo \"wire-extractor cannot invent sample: " ++ reason ++ "\""
+
+
+minimalCtorExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> Constructor -> Subst -> Set TypeKey -> String
+minimalCtorExpr emitName included externalized typeKey ctor subst visiting =
     let
         head =
             ctorQualifier typeKey externalized ++ ctor.name
+
+        args =
+            List.map (applySubst subst) ctor.args
     in
-    case ctor.args of
+    case args of
         [] ->
             head
 
-        args ->
+        _ ->
             head
                 ++ " "
                 ++ String.join " "
@@ -1493,9 +1563,8 @@ minimalCtorExpr emitName included externalized typeKey ctor visiting =
 minimalAnnExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeAnn -> Set TypeKey -> String
 minimalAnnExpr emitName included externalized ann visiting =
     case ann of
-        Generic _ ->
-            -- should not appear on wire roots without instantiation
-            "()"
+        Generic name ->
+            unconstructable ("unsubstituted type variable `" ++ name ++ "`")
 
         Unit ->
             "()"
@@ -1525,15 +1594,14 @@ minimalAnnExpr emitName included externalized ann visiting =
                     ++ " }"
 
         ExtensibleRecord _ fields ->
-            -- treat as closed record for samples
             minimalAnnExpr emitName included externalized (Record fields) visiting
 
         Function _ _ ->
-            "(\\_ -> ())"
+            unconstructable "function type on wire"
 
 
 minimalTypedExpr : (TypeKey -> String) -> Dict TypeKey TypeDef -> Set TypeKey -> TypeKey -> List TypeAnn -> Set TypeKey -> String
-minimalTypedExpr emitName included externalized key args visiting =
+minimalTypedExpr emitName included externalized key typeArgs visiting =
     let
         ( mod, name ) =
             parseKey key
@@ -1564,7 +1632,7 @@ minimalTypedExpr emitName included externalized key args visiting =
         "Nothing"
 
     else if name == "Result" || key == "Result" || modStr == "Result" then
-        case args of
+        case typeArgs of
             [ errAnn, _ ] ->
                 "Err (" ++ minimalAnnExpr emitName included externalized errAnn visiting ++ ")"
 
@@ -1586,7 +1654,7 @@ minimalTypedExpr emitName included externalized key args visiting =
     else if key == "Url" || key == "Url.Url" || (modStr == "Url" && name == "Url") then
         "exampleUrl"
 
-    else if key == "Time.Posix" || (modStr == "Time" && name == "Posix") then
+    else if name == "Posix" && (modStr == "Time" || modStr == "Effect.Time" || String.endsWith ".Time" modStr || key == "Time.Posix") then
         "Time.millisToPosix 0"
 
     else if key == "Time.Month" || (modStr == "Time" && name == "Month") then
@@ -1595,14 +1663,19 @@ minimalTypedExpr emitName included externalized key args visiting =
     else if key == "Time.Weekday" || (modStr == "Time" && name == "Weekday") then
         "Time.Mon"
 
-    else if key == "Time.Zone" || (modStr == "Time" && name == "Zone") then
+    else if name == "Zone" && (modStr == "Time" || modStr == "Effect.Time") then
         "Time.utc"
 
     else if key == "Time.Era" || (modStr == "Time" && name == "Era") then
         "Time.CE"
 
-    else if key == "Http.Error" || (modStr == "Http" && name == "Error") then
-        "Http.BadUrl \"\""
+    else if name == "Error" && (modStr == "Http" || modStr == "Effect.Http") then
+        if modStr == "Effect.Http" || String.contains "Effect.Http" key then
+            -- Effect.Http.Error mirrors Http; prefer BadUrl if exposed similarly
+            "Http.BadUrl \"\""
+
+        else
+            "Http.BadUrl \"\""
 
     else if key == "Bytes.Bytes" || (modStr == "Bytes" && name == "Bytes") then
         "Bytes.fromList []"
@@ -1613,17 +1686,22 @@ minimalTypedExpr emitName included externalized key args visiting =
     else if key == "Order" || name == "Order" then
         "EQ"
 
+    -- Lamdera program-test IDs are opaque; public helpers construct them
+    else if name == "SessionId" && (String.contains "Lamdera" modStr || modStr == "Lamdera") then
+        "Effect.Lamdera.sessionIdFromString \"\""
+
+    else if name == "ClientId" && (String.contains "Lamdera" modStr || modStr == "Lamdera") then
+        "Effect.Lamdera.clientIdFromString \"\""
+
     else if isKernelKey key then
-        -- Fallback for other kernels
         case name of
             "Value" ->
                 "Encode.null"
 
             _ ->
-                "Debug.todo \"minimal kernel " ++ key ++ "\""
+                unconstructable ("kernel type " ++ key)
 
     else if Set.member key visiting then
-        -- Break recursion: only nullary constructors are safe
         case Dict.get key included of
             Just (Custom { constructors }) ->
                 case List.filter (\c -> List.isEmpty c.args) constructors of
@@ -1631,21 +1709,25 @@ minimalTypedExpr emitName included externalized key args visiting =
                         ctorQualifier key externalized ++ c.name
 
                     [] ->
-                        "Debug.todo \"recursive type without nullary ctor: "
-                            ++ key
-                            ++ "\""
+                        unconstructable ("recursive type without nullary ctor: " ++ key)
 
             _ ->
-                "Debug.todo \"recursive " ++ key ++ "\""
+                unconstructable ("recursive type " ++ key)
 
     else
         case Dict.get key included of
-            Just (Alias { body }) ->
-                minimalAnnExpr emitName included externalized body visiting
-
-            Just (Custom { constructors }) ->
-                -- Prefer nullary ctor, else first ctor
+            Just (Alias { body, generics }) ->
                 let
+                    subst =
+                        makeSubst generics typeArgs
+                in
+                minimalAnnExpr emitName included externalized (applySubst subst body) visiting
+
+            Just (Custom { constructors, generics }) ->
+                let
+                    subst =
+                        makeSubst generics typeArgs
+
                     chosen =
                         case List.filter (\c -> List.isEmpty c.args) constructors of
                             c :: _ ->
@@ -1660,18 +1742,27 @@ minimalTypedExpr emitName included externalized key args visiting =
                                         { name = "EMPTY", args = [] }
                 in
                 if chosen.name == "EMPTY" then
-                    "Debug.todo \"no constructors for " ++ key ++ "\""
+                    unconstructable ("no constructors for " ++ key)
 
                 else
-                    minimalCtorExpr emitName included externalized key chosen visiting
+                    minimalCtorExpr emitName included externalized key chosen subst visiting
 
             Nothing ->
-                if Set.member key externalized then
-                    -- Type not in included dict but externalized — try docs already merged into included
-                    "Debug.todo \"externalized missing def " ++ key ++ "\""
+                -- Externalized / package types with known construction patterns
+                if name == "SessionId" then
+                    "Effect.Lamdera.sessionIdFromString \"\""
+
+                else if name == "ClientId" then
+                    "Effect.Lamdera.clientIdFromString \"\""
+
+                else if name == "Posix" then
+                    "Time.millisToPosix 0"
+
+                else if Set.member key externalized then
+                    unconstructable ("externalized type without sample rule: " ++ key)
 
                 else
-                    "Debug.todo \"unknown type " ++ key ++ "\""
+                    unconstructable ("unknown type " ++ key)
 
 
 formatExposing : String -> String
